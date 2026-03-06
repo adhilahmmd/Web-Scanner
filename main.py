@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import sqli, crawler, xss
+from routers import sqli, crawler, xss, bac
 
 app = FastAPI(
     title="Web Vulnerability Scanner",
@@ -21,6 +21,7 @@ app.add_middleware(
 app.include_router(sqli.router, prefix="/api/sqli", tags=["SQL Injection"])
 app.include_router(crawler.router, prefix="/api/crawler", tags=["Web Crawler"])
 app.include_router(xss.router, prefix="/api/xss", tags=["XSS Scanner"])
+app.include_router(bac.router, prefix="/api/bac", tags=["Broken Access Control"])
 
 
 @app.get("/")
@@ -28,7 +29,7 @@ async def root():
     return {
         "name": "Web Vulnerability Scanner API",
         "version": "1.0.0",
-        "modules": ["sqli", "crawler", "xss"],
+        "modules": ["sqli", "crawler", "xss", "bac"],
         "docs": "/docs"
     }
 
