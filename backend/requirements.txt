@@ -3,6 +3,6 @@ uvicorn[standard]==0.29.0
 httpx==0.27.0
 pydantic==2.7.1
 python-multipart==0.0.9
-sqlmap
+aiofiles==23.2.1
 beautifulsoup4==4.12.3
 lxml==5.2.2
