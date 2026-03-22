@@ -1,13 +1,18 @@
 """
 Unified Scan Orchestrator Router
 Runs multiple scanner modules concurrently for a single target URL.
+If a valid JWT is provided, scan results are saved to the database.
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+import json
+import time
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import asyncio
 import uuid
+
+from sqlalchemy.orm import Session
 
 from scanners.crawler_scanner import run_crawler
 from scanners.sqli_scanner import run_sqli_scan
@@ -16,6 +21,9 @@ from scanners.bac_scanner import run_bac_scan
 from scanners.auth_scanner import run_auth_scan
 from scanners.ssl_scanner import run_ssl_scan
 from scanners.http_scanner import run_headers_scan
+
+from core.dependencies import get_optional_user, get_db
+from database.models import User, ScanResult
 
 router = APIRouter()
 
@@ -52,6 +60,8 @@ class UnifiedScanResult(BaseModel):
     medium_count: int
     low_count: int
     overall_risk: str
+    saved_to_history: bool = False
+    history_id: Optional[int] = None
 
 
 async def _run_module(module: str, url: str, timeout: int) -> tuple[str, Any]:
@@ -108,11 +118,44 @@ def _compute_risk(counts: Dict[str, int]) -> str:
     return "info"
 
 
-async def _run_all_modules(url: str, modules: List[str], timeout: int) -> UnifiedScanResult:
-    """Run all requested modules concurrently."""
+def _save_scan_to_db(
+    db: Session,
+    user: User,
+    result: UnifiedScanResult,
+    duration_seconds: int,
+) -> int:
+    """Persist a completed scan to the database. Returns the new scan ID."""
+    scan = ScanResult(
+        user_id=user.id,
+        target_url=result.url,
+        modules_run=json.dumps(result.modules_requested),
+        result_json=json.dumps(result.results),
+        risk_level=result.overall_risk,
+        critical_count=result.critical_count,
+        high_count=result.high_count,
+        medium_count=result.medium_count,
+        low_count=result.low_count,
+        total_findings=result.total_vulnerabilities,
+        scan_duration=duration_seconds,
+    )
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    return scan.id
+
+
+async def _run_all_modules(
+    url: str,
+    modules: List[str],
+    timeout: int,
+) -> tuple[UnifiedScanResult, int]:
+    """Run all requested modules concurrently. Returns (result, duration_seconds)."""
     valid_modules = [m for m in modules if m in AVAILABLE_MODULES]
     tasks = [_run_module(m, url, timeout) for m in valid_modules]
+
+    start = time.monotonic()
     raw_results = await asyncio.gather(*tasks, return_exceptions=False)
+    duration = int(time.monotonic() - start)
 
     results = {}
     completed = []
@@ -128,7 +171,7 @@ async def _run_all_modules(url: str, modules: List[str], timeout: int) -> Unifie
     counts = _count_vulns(results)
     risk = _compute_risk(counts)
 
-    return UnifiedScanResult(
+    scan_result = UnifiedScanResult(
         url=url,
         modules_requested=valid_modules,
         modules_completed=completed,
@@ -139,35 +182,51 @@ async def _run_all_modules(url: str, modules: List[str], timeout: int) -> Unifie
         high_count=counts.get("high", 0),
         medium_count=counts.get("medium", 0),
         low_count=counts.get("low", 0),
-        overall_risk=risk
+        overall_risk=risk,
     )
+    return scan_result, duration
 
 
 # ──────────────────────────────────────────────
 # POST /api/scan  — synchronous unified scan
 # ──────────────────────────────────────────────
 @router.post("/", response_model=UnifiedScanResult, summary="Run Unified Vulnerability Scan")
-async def unified_scan(request: UnifiedScanRequest):
+async def unified_scan(
+    request: UnifiedScanRequest,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
     """
     Run multiple vulnerability scanners concurrently against a target URL.
-    Select which modules to run via the `modules` list.
-    Returns combined results from all modules.
+    If authenticated, results are automatically saved to your scan history.
     """
     if not request.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
 
-    return await _run_all_modules(request.url, request.modules, request.timeout)
+    result, duration = await _run_all_modules(request.url, request.modules, request.timeout)
+
+    if current_user:
+        scan_id = _save_scan_to_db(db, current_user, result, duration)
+        result.saved_to_history = True
+        result.history_id = scan_id
+
+    return result
 
 
 # ──────────────────────────────────────────────
 # POST /api/scan/async  — background unified scan
 # ──────────────────────────────────────────────
 @router.post("/async", summary="Run Unified Scan (Async Job)")
-async def unified_scan_async(request: UnifiedScanRequest, background_tasks: BackgroundTasks):
+async def unified_scan_async(
+    request: UnifiedScanRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
     """
     Kick off a unified scan in the background.
     Returns a `job_id` to poll with GET /api/scan/{job_id}.
-    Recommended for full scans which may take 1-5 minutes.
+    If authenticated, results are saved to history when complete.
     """
     if not request.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
@@ -175,14 +234,32 @@ async def unified_scan_async(request: UnifiedScanRequest, background_tasks: Back
     job_id = str(uuid.uuid4())
     unified_jobs[job_id] = {"status": "running", "progress": 0, "result": None, "url": request.url}
 
+    # Capture user_id before the background task runs (session may close)
+    user_id = current_user.id if current_user else None
+
     async def _run():
+        from database.db import SessionLocal as _SL
         try:
-            result = await _run_all_modules(request.url, request.modules, request.timeout)
+            result, duration = await _run_all_modules(request.url, request.modules, request.timeout)
+
+            history_id = None
+            if user_id:
+                _db = _SL()
+                try:
+                    from database.models import User as _User
+                    user = _db.query(_User).filter(_User.id == user_id).first()
+                    if user:
+                        history_id = _save_scan_to_db(_db, user, result, duration)
+                        result.saved_to_history = True
+                        result.history_id = history_id
+                finally:
+                    _db.close()
+
             unified_jobs[job_id] = {
                 "status": "completed",
                 "progress": 100,
                 "result": result.model_dump(),
-                "url": request.url
+                "url": request.url,
             }
         except Exception as e:
             unified_jobs[job_id] = {
@@ -190,7 +267,7 @@ async def unified_scan_async(request: UnifiedScanRequest, background_tasks: Back
                 "progress": 0,
                 "result": None,
                 "error": str(e),
-                "url": request.url
+                "url": request.url,
             }
 
     background_tasks.add_task(_run)
@@ -219,7 +296,7 @@ async def get_unified_result(job_id: str):
 
 
 # ──────────────────────────────────────────────
-# GET /api/scan/modules  — list available modules
+# GET /api/scan/modules/list  — list available modules
 # ──────────────────────────────────────────────
 @router.get("/modules/list", summary="List Available Scan Modules")
 async def list_modules():

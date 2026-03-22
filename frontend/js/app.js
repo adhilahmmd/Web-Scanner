@@ -71,6 +71,8 @@ function toast(msg, type = 'info') {
   $('#toast-container').appendChild(el);
   setTimeout(() => el.remove(), 4000);
 }
+// Expose globally so auth.js can call it
+window.showToast = toast;
 
 /* ══════════════════════════════════════════════
    Server Status Check
@@ -203,7 +205,11 @@ async function launchScan() {
       updateScanButton(false);
       renderResults(result);
       navigate('results');
-      toast('Scan complete!', 'success');
+      if (window.auth?.isLoggedIn()) {
+        toast('Scan complete! Results saved to your history.', 'success');
+      } else {
+        toast('Scan complete!', 'success');
+      }
     }, 800);
 
   } catch (err) {
@@ -479,18 +485,157 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+function formatDate(isoStr) {
+  try {
+    const d = new Date(isoStr);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) +
+      ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  } catch { return isoStr; }
+}
+
+/* ══════════════════════════════════════════════
+   History Page
+   ══════════════════════════════════════════════ */
+const SHORT_MODULE_NAMES = {
+  crawler: 'Crawler', sqli: 'SQLi', xss: 'XSS', bac: 'BAC',
+  auth: 'Auth', ssl: 'SSL', headers: 'Headers',
+};
+
+async function loadHistory() {
+  const loading = $('#history-loading');
+  const empty = $('#history-empty');
+  const list = $('#history-list');
+  if (!loading || !list) return;
+
+  loading.classList.remove('hidden');
+  empty.classList.add('hidden');
+  list.innerHTML = '';
+
+  try {
+    const scans = await window.auth.fetchHistory();
+    loading.classList.add('hidden');
+
+    if (!scans || scans.length === 0) {
+      empty.classList.remove('hidden');
+      return;
+    }
+
+    $('#history-subtitle').textContent = `${scans.length} saved scan${scans.length !== 1 ? 's' : ''}`;
+    list.innerHTML = scans.map(scan => renderHistoryCard(scan)).join('');
+
+    // Event listeners on cards
+    list.querySelectorAll('.history-card').forEach(card => {
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('.history-delete-btn')) return;
+        loadHistoryScanResults(parseInt(card.dataset.id));
+      });
+    });
+    list.querySelectorAll('.history-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = parseInt(btn.dataset.id);
+        try {
+          await window.auth.deleteScan(id);
+          toast('Scan deleted from history.', 'info');
+          loadHistory();
+        } catch (err) {
+          toast('Could not delete scan: ' + err.message, 'error');
+        }
+      });
+    });
+  } catch (err) {
+    loading.classList.add('hidden');
+    toast('Failed to load history: ' + err.message, 'error');
+  }
+}
+
+function renderHistoryCard(scan) {
+  const risk = scan.risk_level || 'info';
+  const modules = (scan.modules_run || []).map(m =>
+    `<span class="history-module-tag">${SHORT_MODULE_NAMES[m] || m}</span>`
+  ).join('');
+  return `
+    <div class="history-card risk-${risk}" data-id="${scan.id}">
+      <div class="history-card-header">
+        <span class="history-card-url">${escapeHtml(scan.target_url)}</span>
+        <span class="history-risk-badge risk-${risk}">${risk}</span>
+      </div>
+      <div class="history-card-stats">
+        <div class="history-stat stat-critical"><div class="history-stat-value">${scan.critical_count}</div><div class="history-stat-label">Crit</div></div>
+        <div class="history-stat stat-high"><div class="history-stat-value">${scan.high_count}</div><div class="history-stat-label">High</div></div>
+        <div class="history-stat stat-medium"><div class="history-stat-value">${scan.medium_count}</div><div class="history-stat-label">Med</div></div>
+        <div class="history-stat stat-low"><div class="history-stat-value">${scan.low_count}</div><div class="history-stat-label">Low</div></div>
+        <div class="history-stat stat-total"><div class="history-stat-value">${scan.total_findings}</div><div class="history-stat-label">Total</div></div>
+      </div>
+      <div class="history-card-footer">
+        <div class="history-card-modules">${modules}</div>
+        <div class="history-card-actions">
+          <span class="history-card-date">${formatDate(scan.created_at)}</span>
+          <button class="history-delete-btn" data-id="${scan.id}" title="Delete scan">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadHistoryScanResults(scanId) {
+  try {
+    const detail = await window.auth.fetchScanDetail(scanId);
+    if (!detail || !detail.result_json) {
+      toast('No result data available for this scan.', 'info');
+      return;
+    }
+    // Reconstruct findings and render results page
+    const results = detail.result_json;
+    const allFindings = buildFindingsList(results, detail.modules_run || []);
+    const result = {
+      url: detail.target_url,
+      modules_requested: detail.modules_run || [],
+      modules_completed: detail.modules_run || [],
+      modules_failed: [],
+      results,
+      total_vulnerabilities: detail.total_findings,
+      critical_count: detail.critical_count,
+      high_count: detail.high_count,
+      medium_count: detail.medium_count,
+      low_count: detail.low_count,
+      overall_risk: detail.risk_level || 'info',
+    };
+    state.scanResults = result;
+    state.allFindings = allFindings;
+    renderResults(result);
+    navigate('results');
+    toast('Loaded historical scan results.', 'info');
+  } catch (err) {
+    toast('Could not load scan detail: ' + err.message, 'error');
+  }
+}
+
 /* ══════════════════════════════════════════════
    Init
    ══════════════════════════════════════════════ */
 function init() {
   // Expose navigate for inline events
-  window.app = { navigate };
+  window.app = { navigate, loadHistory };
 
-  // Nav links
+  // Nav links — guard history behind login
   $$('.nav-item[data-page]').forEach(link => {
     link.addEventListener('click', (e) => {
       e.preventDefault();
-      navigate(link.dataset.page);
+      const page = link.dataset.page;
+      if (page === 'history') {
+        if (!window.auth?.isLoggedIn()) {
+          window.openAuthModal?.('login');
+          toast('Please sign in to view your scan history.', 'info');
+          return;
+        }
+        navigate('history');
+        loadHistory();
+        return;
+      }
+      navigate(page);
     });
   });
 
@@ -507,6 +652,9 @@ function init() {
 
   // New scan button
   $('#new-scan-btn')?.addEventListener('click', () => navigate('scanner'));
+
+  // History new scan button
+  $('#history-new-scan-btn')?.addEventListener('click', () => navigate('scanner'));
 
   // Export buttons
   $('#download-json-btn')?.addEventListener('click', exportJSON);

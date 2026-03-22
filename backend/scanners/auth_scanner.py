@@ -196,7 +196,12 @@ def extract_session_cookies(response: httpx.Response) -> List[Dict]:
 def parse_set_cookie_headers(response: httpx.Response) -> List[Dict]:
     """Parse Set-Cookie headers directly for full flag inspection."""
     cookies = []
-    for header_val in response.headers.get_list("set-cookie") if hasattr(response.headers, 'get_list') else [response.headers.get("set-cookie", "")]:
+    _raw_headers = response.headers.get_list("set-cookie") if hasattr(response.headers, 'get_list') else []
+    if not _raw_headers:
+        _single = response.headers.get("set-cookie")
+        if _single:
+            _raw_headers = [_single]
+    for header_val in _raw_headers:
         if not header_val:
             continue
         cookie = {
@@ -659,7 +664,7 @@ async def test_session_token_entropy(
                                     "Minimum token length: 128 bits (16 bytes) of entropy. "
                                     "Use frameworks' built-in session managers."
                                 ),
-                                detail=dict(detail),
+                                detail=detail.model_dump(),
                             ))
         except Exception as e:
             errors.append(f"Token entropy check error: {str(e)}")
@@ -996,8 +1001,10 @@ async def run_auth_scan(
     username_field: str = "username",
     password_field: str = "password",
     timeout: int = 10,
-    cookies: Dict = {},
+    cookies: Optional[Dict] = None,
 ) -> dict:
+    if cookies is None:
+        cookies = {}
     findings: List[AuthFinding] = []
     errors: List[str] = []
     checks: List[str] = []
@@ -1011,6 +1018,7 @@ async def run_auth_scan(
         follow_redirects=True,
         cookies=cookies,
         headers={"User-Agent": "WebVulnScanner/1.0 (educational use)"},
+        timeout=timeout,
     ) as client:
         # Verify target reachable
         try:

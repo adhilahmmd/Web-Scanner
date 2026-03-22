@@ -50,12 +50,32 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
         <span>Results</span>
       </a>
+      <a href="#" class="nav-item hidden" data-page="history" id="nav-history">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>Scan History</span>
+      </a>
     </nav>
 
     <div class="sidebar-footer">
       <div class="server-status" id="server-status">
         <div class="status-dot"></div>
         <span>Connecting...</span>
+      </div>
+      <div id="sidebar-guest" class="sidebar-auth-guest">
+        <button class="btn btn-primary btn-auth-guest" id="open-auth-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          Sign In
+        </button>
+      </div>
+      <div id="sidebar-user" class="sidebar-user-widget hidden">
+        <div class="user-avatar" id="user-initials">??</div>
+        <div class="user-meta">
+          <span class="user-name" id="user-display-name">—</span>
+          <span class="user-email" id="user-display-email">—</span>
+        </div>
+        <button class="logout-btn" id="logout-btn" title="Sign out">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
       </div>
     </div>
   </aside>
@@ -528,6 +548,33 @@
       </div>
     </section>
 
+    <!-- History Page -->
+    <section class="page" id="page-history">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Scan History</h1>
+          <p class="page-subtitle" id="history-subtitle">Your saved vulnerability scans</p>
+        </div>
+        <button class="btn btn-primary" id="history-new-scan-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          New Scan
+        </button>
+      </div>
+      <div class="history-loading hidden" id="history-loading">
+        <div class="history-loader-inner">
+          <div class="radar-animation"><div class="radar-ring r1"></div><div class="radar-ring r2"></div><div class="radar-ring r3"></div><div class="radar-dot"></div></div>
+          <p style="color:var(--text-secondary)">Loading history...</p>
+        </div>
+      </div>
+      <div class="results-empty hidden" id="history-empty">
+        <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
+        <h3>No Scans Yet</h3>
+        <p>Run a scan from the Scanner to see it saved here.</p>
+        <button class="btn btn-primary" onclick="window.app.navigate('scanner')">Start a Scan</button>
+      </div>
+      <div id="history-list" class="history-grid"></div>
+    </section>
+
   </main>
 
   <!-- Finding detail modal -->
@@ -546,7 +593,65 @@
   <!-- Toast notifications -->
   <div class="toast-container" id="toast-container"></div>
 
+  <!-- Auth Modal -->
+  <div class="modal-overlay auth-modal-overlay hidden" id="auth-modal">
+    <div class="auth-modal glass-card">
+      <button class="modal-close auth-modal-close" id="modal-close-auth">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <div class="auth-logo">
+        <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" width="40" height="40">
+          <path d="M16 2L4 8v8c0 7.2 5.1 13.9 12 15.9C23 29.9 28 23.2 28 16V8L16 2z" fill="url(#ag)"/>
+          <path d="M12 16l3 3 5-6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <defs><linearGradient id="ag" x1="4" y1="2" x2="28" y2="32" gradientUnits="userSpaceOnUse"><stop stop-color="#00d4ff"/><stop offset="1" stop-color="#7b2fff"/></linearGradient></defs>
+        </svg>
+        <span class="auth-logo-text">WebSecuity</span>
+      </div>
+      <div class="auth-tabs">
+        <button class="auth-tab active" id="auth-tab-login">Sign In</button>
+        <button class="auth-tab" id="auth-tab-register">Create Account</button>
+      </div>
+      <form id="auth-login-form" class="auth-form">
+        <div class="form-group">
+          <label class="form-label" for="login-username">Username</label>
+          <input type="text" id="login-username" class="form-input" placeholder="Enter your username" autocomplete="username" required />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="login-password">Password</label>
+          <input type="password" id="login-password" class="form-input" placeholder="Enter your password" autocomplete="current-password" required />
+        </div>
+        <p class="auth-error"></p>
+        <button type="submit" class="btn btn-primary btn-scan auth-submit-btn">Sign In</button>
+        <p class="auth-switch">No account? <a href="#" onclick="document.getElementById('auth-tab-register').click();return false;">Create one &rarr;</a></p>
+      </form>
+      <form id="auth-register-form" class="auth-form hidden">
+        <div class="form-group">
+          <label class="form-label" for="reg-username">Username</label>
+          <input type="text" id="reg-username" class="form-input" placeholder="3-50 chars, letters/digits/_" autocomplete="username" required />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="reg-email">Email</label>
+          <input type="email" id="reg-email" class="form-input" placeholder="your@email.com" autocomplete="email" required />
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="reg-password">Password</label>
+            <input type="password" id="reg-password" class="form-input" placeholder="Min. 8 chars" autocomplete="new-password" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="reg-confirm">Confirm</label>
+            <input type="password" id="reg-confirm" class="form-input" placeholder="Repeat" autocomplete="new-password" required />
+          </div>
+        </div>
+        <p class="auth-error"></p>
+        <button type="submit" class="btn btn-primary btn-scan auth-submit-btn">Create Account</button>
+        <p class="auth-switch">Have an account? <a href="#" onclick="document.getElementById('auth-tab-login').click();return false;">Sign in &rarr;</a></p>
+      </form>
+    </div>
+  </div>
+
   <script src="/js/api.js"></script>
+  <script src="/js/auth.js"></script>
   <script src="/js/chart.js"></script>
   <script src="/js/app.js"></script>
 </body>

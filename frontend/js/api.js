@@ -11,10 +11,11 @@ class API {
   }
 
   async _fetch(method, path, body = null) {
-    const opts = {
-      method,
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
-    };
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+    // Inject auth token if available
+    const token = window.auth?.getToken?.();
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const opts = { method, headers };
     if (body) opts.body = JSON.stringify(body);
     const res = await fetch(this.base + path, opts);
     if (!res.ok) {
@@ -23,6 +24,7 @@ class API {
     }
     return res.json();
   }
+
 
   // ── Health ────────────────────────────────────
   async health() {

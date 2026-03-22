@@ -4,12 +4,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from routers import sqli, crawler, xss, bac, auth, ssl, http
 from routers import scan
+from routers import users, history
+from database.db import init_db
 import os
 
 app = FastAPI(
     title="Web Vulnerability Scanner",
-    description="Modular web application security scanner",
-    version="1.0.0"
+    description="Modular web application security scanner with user authentication",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -21,6 +23,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize database on startup
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
 # Register API routers
 app.include_router(sqli.router, prefix="/api/sqli", tags=["SQL Injection"])
 app.include_router(crawler.router, prefix="/api/crawler", tags=["Web Crawler"])
@@ -30,6 +37,10 @@ app.include_router(auth.router, prefix="/api/auth", tags=["Broken Authentication
 app.include_router(ssl.router, prefix="/api/ssl", tags=["SSL/TLS Analysis"])
 app.include_router(http.router, prefix="/api/headers", tags=["HTTP Security Headers"])
 app.include_router(scan.router, prefix="/api/scan", tags=["Unified Scanner"])
+
+# User authentication & history
+app.include_router(users.router, prefix="/api/users", tags=["User Auth"])
+app.include_router(history.router, prefix="/api/history", tags=["Scan History"])
 
 
 @app.get("/health")
@@ -51,8 +62,9 @@ else:
     async def root():
         return {
             "name": "Web Vulnerability Scanner API",
-            "version": "1.0.0",
+            "version": "2.0.0",
             "modules": ["sqli", "crawler", "xss", "bac", "auth", "ssl", "headers", "scan"],
+            "auth_modules": ["users", "history"],
             "docs": "/docs",
             "note": "Frontend not found — run from project root or build frontend first"
-        }
+        }
