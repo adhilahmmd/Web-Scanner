@@ -37,13 +37,21 @@ class UnifiedScanRequest(BaseModel):
     url: str
     modules: Optional[List[str]] = AVAILABLE_MODULES
     timeout: Optional[int] = 10
+    use_crawler: Optional[bool] = True
+    max_depth: Optional[int] = 2
+    max_pages: Optional[int] = 20
+    scan_all_links: Optional[bool] = True
 
     class Config:
         json_schema_extra = {
             "example": {
                 "url": "http://testphp.vulnweb.com",
                 "modules": ["sqli", "xss", "headers", "ssl"],
-                "timeout": 10
+                "timeout": 10,
+                "use_crawler": True,
+                "max_depth": 2,
+                "max_pages": 20,
+                "scan_all_links": True
             }
         }
 
@@ -64,24 +72,23 @@ class UnifiedScanResult(BaseModel):
     history_id: Optional[int] = None
 
 
-async def _run_module(module: str, url: str, timeout: int) -> tuple[str, Any]:
+async def _run_module(module: str, urls: List[str], timeout: int) -> tuple[str, Any]:
     """Run a single scanner module and return (module_name, result)."""
     try:
-        if module == "crawler":
-            result = await run_crawler(url=url, max_depth=2, max_pages=20, timeout=timeout)
-        elif module == "sqli":
-            result = await run_sqli_scan(url=url, timeout=timeout)
+        primary_url = urls[0] if urls else ""
+        if module == "sqli":
+            result = await run_sqli_scan(urls=urls, timeout=timeout)
         elif module == "xss":
-            result = await run_xss_scan(url=url, timeout=timeout, test_forms=True, test_headers=True, test_json=True)
+            result = await run_xss_scan(urls=urls, timeout=timeout, test_forms=True, test_headers=True, test_json=True)
         elif module == "bac":
-            result = await run_bac_scan(url=url, timeout=timeout, cookies={}, extra_headers={})
+            result = await run_bac_scan(urls=urls, timeout=timeout, cookies=None, extra_headers=None)
         elif module == "auth":
-            result = await run_auth_scan(url=url, login_path=None, username_field="username",
-                                          password_field="password", timeout=timeout, cookies={})
+            result = await run_auth_scan(urls=urls, login_path="/login", username_field="username",
+                                          password_field="password", timeout=timeout, cookies=None)
         elif module == "ssl":
-            result = await run_ssl_scan(url=url, timeout=timeout)
+            result = await run_ssl_scan(url=primary_url, timeout=timeout)
         elif module == "headers":
-            result = await run_headers_scan(url=url, timeout=timeout, follow_redirects=True)
+            result = await run_headers_scan(url=primary_url, timeout=timeout, follow_redirects=True)
         else:
             return module, {"error": f"Unknown module: {module}"}
         return module, result
@@ -98,9 +105,15 @@ def _count_vulns(results: Dict[str, Any]) -> Dict[str, int]:
             continue
         findings = data.get("findings", [])
         for finding in findings:
-            sev = (finding.get("severity") or "").lower()
-            if sev in counts:
+            if isinstance(finding, dict):
+                sev = (finding.get("severity") or "").lower()
+            else:
+                sev = (getattr(finding, "severity", "") or "").lower()
+
+            if sev in ("critical", "high", "medium", "low", "info"):
                 counts[sev] += 1
+            else:
+                counts["info"] += 1
             counts["total"] += 1
 
     return counts
@@ -148,25 +161,76 @@ async def _run_all_modules(
     url: str,
     modules: List[str],
     timeout: int,
+    use_crawler: bool = True,
+    max_depth: int = 2,
+    max_pages: int = 20,
+    scan_all_links: bool = True,
 ) -> tuple[UnifiedScanResult, int]:
-    """Run all requested modules concurrently. Returns (result, duration_seconds)."""
+    """Run all requested modules, running crawler first if needed. Returns (result, duration_seconds)."""
     valid_modules = [m for m in modules if m in AVAILABLE_MODULES]
-    tasks = [_run_module(m, url, timeout) for m in valid_modules]
-
+    
     start = time.monotonic()
-    raw_results = await asyncio.gather(*tasks, return_exceptions=False)
-    duration = int(time.monotonic() - start)
-
     results = {}
     completed = []
     failed = []
+    
+    # 1. Pipeline Stage 1: Discovery (Crawler)
+    target_urls = [url]
+    run_crawler_explicitly = "crawler" in valid_modules
+    needs_crawling = use_crawler and any(m in ["sqli", "xss", "bac", "auth"] for m in valid_modules)
 
-    for module_name, data in raw_results:
-        results[module_name] = data
-        if isinstance(data, dict) and "error" in data:
-            failed.append(module_name)
-        else:
-            completed.append(module_name)
+    if use_crawler and (needs_crawling or run_crawler_explicitly):
+        try:
+            from scanners.crawler_scanner import run_crawler
+            crawler_result = await run_crawler(
+                url=url,
+                max_depth=max_depth,
+                max_pages=max_pages,
+                timeout=timeout,
+            )
+
+            if run_crawler_explicitly:
+                results["crawler"] = crawler_result
+                if "error" in crawler_result:
+                    failed.append("crawler")
+                else:
+                    completed.append("crawler")
+
+            # Only expand target list when scan_all_links is True
+            if scan_all_links and "error" not in crawler_result:
+                discovered_links = crawler_result.get("all_links", [])
+                api_endpoints = crawler_result.get("api_endpoints", [])
+                hidden_paths = crawler_result.get("hidden_paths", [])
+
+                endpoints = list(discovered_links) + list(hidden_paths)
+                for api in api_endpoints:
+                    if isinstance(api, dict) and "endpoint" in api:
+                        endpoints.append(api["endpoint"])
+                    elif hasattr(api, "endpoint"):
+                        endpoints.append(api.endpoint)
+
+                for link in endpoints:
+                    if link and link not in target_urls and len(target_urls) < max_pages:
+                        target_urls.append(link)
+        except Exception as e:
+            if run_crawler_explicitly:
+                results["crawler"] = {"error": str(e)}
+                failed.append("crawler")
+
+    # 2. Pipeline Stage 2: Assessment (Scanners)
+    remaining_modules = [m for m in valid_modules if m != "crawler"]
+    tasks = [_run_module(m, target_urls, timeout) for m in remaining_modules]
+    
+    if tasks:
+        raw_results = await asyncio.gather(*tasks, return_exceptions=False)
+        for module_name, data in raw_results:
+            results[module_name] = data
+            if isinstance(data, dict) and "error" in data:
+                failed.append(module_name)
+            else:
+                completed.append(module_name)
+            
+    duration = int(time.monotonic() - start)
 
     counts = _count_vulns(results)
     risk = _compute_risk(counts)
@@ -203,7 +267,13 @@ async def unified_scan(
     if not request.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
 
-    result, duration = await _run_all_modules(request.url, request.modules, request.timeout)
+    result, duration = await _run_all_modules(
+        request.url, request.modules, request.timeout,
+        use_crawler=request.use_crawler,
+        max_depth=request.max_depth,
+        max_pages=request.max_pages,
+        scan_all_links=request.scan_all_links,
+    )
 
     if current_user:
         scan_id = _save_scan_to_db(db, current_user, result, duration)
@@ -240,7 +310,13 @@ async def unified_scan_async(
     async def _run():
         from database.db import SessionLocal as _SL
         try:
-            result, duration = await _run_all_modules(request.url, request.modules, request.timeout)
+            result, duration = await _run_all_modules(
+                request.url, request.modules, request.timeout,
+                use_crawler=request.use_crawler,
+                max_depth=request.max_depth,
+                max_pages=request.max_pages,
+                scan_all_links=request.scan_all_links,
+            )
 
             history_id = None
             if user_id:
@@ -262,11 +338,13 @@ async def unified_scan_async(
                 "url": request.url,
             }
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             unified_jobs[job_id] = {
                 "status": "failed",
                 "progress": 0,
                 "result": None,
-                "error": str(e),
+                "error": str(e) or "Unknown error",
                 "url": request.url,
             }
 
@@ -292,7 +370,7 @@ async def get_unified_result(job_id: str):
     if job["status"] == "running":
         return {"job_id": job_id, "status": "running", "progress": job.get("progress", 0), "result": None}
 
-    return {"job_id": job_id, "status": job["status"], "progress": 100, "result": job.get("result")}
+    return {"job_id": job_id, "status": job["status"], "progress": 100, "result": job.get("result"), "error": job.get("error")}
 
 
 # ──────────────────────────────────────────────

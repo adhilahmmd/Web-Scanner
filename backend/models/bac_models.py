@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 from enum import Enum
 
@@ -28,8 +28,8 @@ class BypassTechnique(str, Enum):
 class BACRequest(BaseModel):
     url: str
     timeout: Optional[int] = 10
-    cookies: Optional[Dict[str, str]] = {}
-    headers: Optional[Dict[str, str]] = {}
+    cookies: Optional[Dict[str, str]] = Field(default_factory=dict)
+    headers: Optional[Dict[str, str]] = Field(default_factory=dict)
 
     class Config:
         json_schema_extra = {

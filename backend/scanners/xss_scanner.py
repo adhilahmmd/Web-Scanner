@@ -551,7 +551,7 @@ async def test_json_xss(
 # ──────────────────────────────────────────────
 
 async def run_xss_scan(
-    url: str,
+    urls: List[str],
     timeout: int = 10,
     test_forms: bool = True,
     test_headers: bool = True,
@@ -561,16 +561,39 @@ async def run_xss_scan(
     errors: List[str] = []
     payloads_tested: List[str] = []
 
+    if isinstance(urls, str):
+        urls = [urls]
+
+    if not urls:
+        return {
+            "url": "none",
+            "status": "completed",
+            "summary": XSSSummary(
+                total_parameters_tested=0,
+                total_payloads_tested=0,
+                vulnerabilities_found=0,
+                reflected_xss=0,
+                stored_xss=0,
+                dom_xss=0,
+                risk_level=SeverityLevel.LOW,
+            ),
+            "findings": [],
+            "errors": ["No URLs provided to test."],
+        }
+
+    primary_url = urls[0]
+    total_params = 0
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         headers={"User-Agent": "WebVulnScanner/1.0 (educational use)"},
     ) as client:
         # Verify target is reachable
         try:
-            await client.get(url, timeout=timeout)
+            await client.get(primary_url, timeout=timeout)
         except Exception as e:
             return {
-                "url": url,
+                "url": primary_url,
                 "status": "unreachable",
                 "summary": XSSSummary(
                     total_parameters_tested=0,
@@ -585,25 +608,28 @@ async def run_xss_scan(
                 "errors": [f"Could not reach target: {str(e)}"],
             }
 
-        # Run all test types concurrently
-        tasks = [
-            test_reflected_url_params(client, url, timeout, findings, errors, payloads_tested),
-            test_dom_xss(client, url, timeout, findings, errors, payloads_tested),
-        ]
-        if test_forms:
-            tasks.append(test_forms_xss(client, url, timeout, findings, errors, payloads_tested))
-        if test_headers:
-            tasks.append(test_header_xss(client, url, timeout, findings, errors, payloads_tested))
-        if test_json:
-            tasks.append(test_json_xss(client, url, timeout, findings, errors, payloads_tested))
+        # Run testing for all URLs
+        for url in urls:
+            total_params += len(extract_url_params(url))
+            
+            tasks = [
+                test_reflected_url_params(client, url, timeout, findings, errors, payloads_tested),
+                test_dom_xss(client, url, timeout, findings, errors, payloads_tested),
+            ]
+            if test_forms:
+                tasks.append(test_forms_xss(client, url, timeout, findings, errors, payloads_tested))
+            if test_headers:
+                tasks.append(test_header_xss(client, url, timeout, findings, errors, payloads_tested))
+            if test_json:
+                tasks.append(test_json_xss(client, url, timeout, findings, errors, payloads_tested))
 
-        await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
 
-    # Deduplicate by (xss_type, parameter)
+    # Deduplicate by (xss_type, parameter, payload)
     seen = set()
     unique_findings = []
     for f in findings:
-        key = (f.xss_type, f.parameter)
+        key = (f.xss_type, f.parameter, f.payload)
         if key not in seen:
             seen.add(key)
             unique_findings.append(f)
@@ -612,9 +638,8 @@ async def run_xss_scan(
     stored_count = sum(1 for f in unique_findings if f.xss_type == XSSType.STORED)
     dom_count = sum(1 for f in unique_findings if f.xss_type == XSSType.DOM)
 
-    params = extract_url_params(url)
     summary = XSSSummary(
-        total_parameters_tested=len(params),
+        total_parameters_tested=total_params,
         total_payloads_tested=len(payloads_tested),
         vulnerabilities_found=len(unique_findings),
         reflected_xss=reflected_count,
@@ -624,7 +649,7 @@ async def run_xss_scan(
     )
 
     return {
-        "url": url,
+        "url": primary_url,
         "status": "completed",
         "summary": summary,
         "findings": unique_findings,

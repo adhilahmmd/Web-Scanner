@@ -650,14 +650,40 @@ async def test_header_bypass(
 # ──────────────────────────────────────────────
 
 async def run_bac_scan(
-    url: str,
+    urls: List[str],
     timeout: int = 10,
-    cookies: Dict = {},
-    extra_headers: Dict = {},
+    cookies: Dict = None,
+    extra_headers: Dict = None,
 ) -> dict:
+    if cookies is None: cookies = {}
+    if extra_headers is None: extra_headers = {}
+    
     findings: List[BACFinding] = []
     errors: List[str] = []
     checks: List[str] = []
+
+    if isinstance(urls, str):
+        urls = [urls]
+
+    if not urls:
+        return {
+            "url": "none",
+            "status": "completed",
+            "summary": BACSummary(
+                total_checks=0,
+                vulnerabilities_found=0,
+                idor_findings=0,
+                forced_browsing_findings=0,
+                privilege_escalation_findings=0,
+                missing_auth_findings=0,
+                method_tampering_findings=0,
+                risk_level=SeverityLevel.LOW,
+            ),
+            "findings": [],
+            "errors": ["No URLs provided to test."],
+        }
+
+    primary_url = urls[0]
 
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -669,10 +695,10 @@ async def run_bac_scan(
     ) as client:
         # Verify reachable
         try:
-            await client.get(url, timeout=timeout)
+            await client.get(primary_url, timeout=timeout)
         except Exception as e:
             return {
-                "url": url,
+                "url": primary_url,
                 "status": "unreachable",
                 "summary": BACSummary(
                     total_checks=0,
@@ -688,21 +714,22 @@ async def run_bac_scan(
                 "errors": [f"Could not reach target: {str(e)}"],
             }
 
-        # Run all checks concurrently
-        await asyncio.gather(
-            test_idor(client, url, timeout, findings, errors, checks),
-            test_forced_browsing(client, url, timeout, findings, errors, checks),
-            test_privilege_escalation(client, url, timeout, findings, errors, checks),
-            test_missing_auth(client, url, timeout, findings, errors, checks),
-            test_method_tampering(client, url, timeout, findings, errors, checks),
-            test_header_bypass(client, url, timeout, findings, errors, checks),
-        )
+        # Run testing for all URLs concurrently within limits
+        for url in urls:
+            await asyncio.gather(
+                test_idor(client, url, timeout, findings, errors, checks),
+                test_forced_browsing(client, url, timeout, findings, errors, checks),
+                test_privilege_escalation(client, url, timeout, findings, errors, checks),
+                test_missing_auth(client, url, timeout, findings, errors, checks),
+                test_method_tampering(client, url, timeout, findings, errors, checks),
+                test_header_bypass(client, url, timeout, findings, errors, checks),
+            )
 
-    # Deduplicate by (check_type, target_url, parameter)
+    # Deduplicate by (check_type, target_url, parameter, tampered_value)
     seen = set()
     unique_findings = []
     for f in findings:
-        key = (f.check_type, f.target_url, f.parameter)
+        key = (f.check_type, f.target_url, f.parameter, getattr(f, "tampered_value", ""))
         if key not in seen:
             seen.add(key)
             unique_findings.append(f)
@@ -719,7 +746,7 @@ async def run_bac_scan(
     )
 
     return {
-        "url": url,
+        "url": primary_url,
         "status": "completed",
         "summary": summary,
         "findings": unique_findings,

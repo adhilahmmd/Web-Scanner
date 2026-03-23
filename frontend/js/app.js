@@ -1,6 +1,6 @@
 /**
  * WebSecuity – Main Application Logic
- * SPA navigation, scan flow, results rendering, modal, toast, filters.
+ * SPA navigation, scan wizard flow, results rendering, modal, toast, filters.
  */
 
 /* ══════════════════════════════════════════════
@@ -30,9 +30,10 @@ const SEV_COLORS = {
    ══════════════════════════════════════════════ */
 const state = {
   currentPage: 'dashboard',
-  scanResults: null,   // last completed scan
-  allFindings: [],     // flat list of all findings {module, ...finding}
+  scanResults: null,
+  allFindings: [],
   scanning: false,
+  wizardStep: 1,  // 1 = Target+Crawler, 2 = Modules+Scope, 3 = Active Scan
 };
 
 /* ══════════════════════════════════════════════
@@ -57,6 +58,11 @@ function navigate(page) {
   $(`#page-${page}`).classList.add('active');
   $(`#nav-${page}`)?.classList.add('active');
 
+  // Reset wizard to step 1 when navigating to scanner
+  if (page === 'scanner' && !state.scanning) {
+    goToStep(1);
+  }
+
   // Close mobile sidebar
   $('#sidebar').classList.remove('open');
 }
@@ -71,7 +77,6 @@ function toast(msg, type = 'info') {
   $('#toast-container').appendChild(el);
   setTimeout(() => el.remove(), 4000);
 }
-// Expose globally so auth.js can call it
 window.showToast = toast;
 
 /* ══════════════════════════════════════════════
@@ -111,9 +116,46 @@ function setProgress(pct) {
 }
 
 /* ══════════════════════════════════════════════
+   Wizard Step Management
+   ══════════════════════════════════════════════ */
+function goToStep(n) {
+  state.wizardStep = n;
+
+  // Show/hide step panels
+  $$('.wizard-step-panel').forEach(panel => panel.classList.remove('active'));
+  const panel = $(`#wizard-step-${n}`);
+  if (panel) panel.classList.add('active');
+
+  // Update stepper indicator
+  $$('.step-indicator').forEach((el, i) => {
+    el.classList.remove('active', 'done');
+    if (i + 1 < n) el.classList.add('done');
+    else if (i + 1 === n) el.classList.add('active');
+  });
+}
+
+/* ══════════════════════════════════════════════
+   Crawler Toggle
+   ══════════════════════════════════════════════ */
+function isCrawlerEnabled() {
+  const toggle = $('#crawler-toggle-on');
+  return toggle ? toggle.checked : true;
+}
+
+function updateCrawlerControls() {
+  const enabled = isCrawlerEnabled();
+  const controls = $('#crawler-controls');
+  if (controls) {
+    controls.style.opacity = enabled ? '1' : '0.35';
+    controls.style.pointerEvents = enabled ? 'auto' : 'none';
+  }
+}
+
+/* ══════════════════════════════════════════════
    Scan Flow
    ══════════════════════════════════════════════ */
 async function launchScan() {
+  // ── Collect Step 1 ──
   const urlInput = $('#target-url');
   const url = urlInput.value.trim();
 
@@ -123,15 +165,24 @@ async function launchScan() {
     return;
   }
 
+  const useCrawler = isCrawlerEnabled();
+  const maxDepth   = parseInt($('#crawl-depth')?.value) || 2;
+  const maxPages   = parseInt($('#crawl-max-links')?.value) || 20;
+  const timeout    = parseInt($('#scan-timeout')?.value) || 15;
+
+  // ── Collect Step 2 ──
   const modules = $$('input[name="module"]:checked').map(cb => cb.value);
   if (modules.length === 0) {
     toast('Select at least one scanner module.', 'error');
+    goToStep(2);
     return;
   }
+  const scanAllLinks = $('input[name="scan-scope"][value="all"]')?.checked ?? true;
 
-  const timeout = parseInt($('#scan-timeout').value) || 15;
+  const crawlerConfig = { use_crawler: useCrawler, max_depth: maxDepth, max_pages: maxPages, scan_all_links: scanAllLinks };
 
-  // Switch UI to scanning mode
+  // ── Switch to Step 3 (active scan) ──
+  goToStep(3);
   state.scanning = true;
   updateScanButton(true);
   showScanActive(url);
@@ -140,66 +191,64 @@ async function launchScan() {
   $('#scan-log').innerHTML = '';
   addLog(`[ * ] Starting scan on: ${url}`, 'info');
   addLog(`[ * ] Modules: ${modules.join(', ')}`, 'info');
+  addLog(`[ * ] Crawler: ${useCrawler ? `ON (depth=${maxDepth}, max=${maxPages} links, scope=${scanAllLinks ? 'all' : 'seed only'})` : 'OFF'}`, 'info');
   addLog(`[ * ] Timeout: ${timeout}s per module`, 'muted');
   addLog('', 'muted');
 
-  const moduleResults = {};
-  const completed = [];
-  const failed = [];
+  setProgress(5);
 
   try {
-    await window.api.runModules(
-      url,
-      modules,
-      timeout,
-      // onModuleDone
-      (modName, result, err) => {
-        if (err) {
-          addLog(`[ ✗ ] ${MODULE_NAMES[modName] || modName}: FAILED — ${err}`, 'error');
-          moduleResults[modName] = { error: err };
-          failed.push(modName);
-        } else {
-          const count = (result?.findings || []).length;
-          const severity = result?.summary?.risk_level || result?.summary?.grade || '—';
-          addLog(`[ ✓ ] ${MODULE_NAMES[modName] || modName}: ${count} finding(s) | Risk: ${severity}`, 'success');
-          moduleResults[modName] = result;
-          completed.push(modName);
-        }
-      },
-      // onProgress
+    const pollResult = await window.api.runModules(
+      url, modules, timeout, crawlerConfig,
       (pct) => setProgress(pct)
     );
 
-    addLog('', 'muted');
-    addLog('[ ✓ ] Scan complete! Rendering results...', 'success');
     setProgress(100);
+    addLog('', 'muted');
+    addLog('[ ✓ ] Scan complete! Processing results...', 'success');
 
-    // Build combined result
+    // pollResult IS the full unified result object from the backend
+    const moduleResults = pollResult.results || {};
+    const modulesCompleted = pollResult.modules_completed || modules;
+    const modulesFailed    = pollResult.modules_failed || [];
+
+    // Log per-module status
+    for (const mod of modules) {
+      const data = moduleResults[mod];
+      if (modulesFailed.includes(mod)) {
+        const errMsg = (data && data.error) ? data.error : 'Unknown error';
+        addLog(`[ ✗ ] ${MODULE_NAMES[mod] || mod}: FAILED — ${errMsg}`, 'error');
+      } else if (data) {
+        const count = (data.findings || []).length;
+        const severity = data.summary?.risk_level || data.summary?.grade || '—';
+        addLog(`[ ✓ ] ${MODULE_NAMES[mod] || mod}: ${count} finding(s) | Risk: ${severity}`, 'success');
+      }
+    }
+
+    // Build findings from the returned results
     const allFindings = buildFindingsList(moduleResults, modules);
-    const counts = countSeverities(allFindings);
-    const risk = topRisk(counts);
+    const counts      = countSeverities(allFindings);
+    const risk        = pollResult.overall_risk || topRisk(counts);
 
     const result = {
       url,
       modules_requested: modules,
-      modules_completed: completed,
-      modules_failed: failed,
-      results: moduleResults,
-      total_vulnerabilities: allFindings.length,
-      critical_count: counts.critical,
-      high_count: counts.high,
-      medium_count: counts.medium,
-      low_count: counts.low,
-      overall_risk: risk,
+      modules_completed: modulesCompleted,
+      modules_failed:    modulesFailed,
+      results:           moduleResults,
+      total_vulnerabilities: pollResult.total_vulnerabilities ?? allFindings.length,
+      critical_count: pollResult.critical_count ?? counts.critical,
+      high_count:     pollResult.high_count ?? counts.high,
+      medium_count:   pollResult.medium_count ?? counts.medium,
+      low_count:      pollResult.low_count ?? counts.low,
+      overall_risk:   risk,
     };
 
     state.scanResults = result;
     state.allFindings = allFindings;
 
-    // Update dashboard stats
     updateDashboardStats(result);
 
-    // Show results after small delay
     setTimeout(() => {
       state.scanning = false;
       updateScanButton(false);
@@ -219,6 +268,8 @@ async function launchScan() {
     updateScanButton(false);
     addLog(`[ ✗ ] Error: ${err.message}`, 'error');
     toast(`Scan failed: ${err.message}`, 'error');
+    // Allow going back to config
+    setTimeout(() => goToStep(2), 1500);
   }
 }
 
@@ -230,7 +281,7 @@ function buildFindingsList(moduleResults, modules) {
   for (const mod of modules) {
     const data = moduleResults[mod];
     if (!data || data.error) continue;
-    const findings = data.findings || [];
+    const findings = Array.isArray(data.findings) ? data.findings : [];
     for (const f of findings) {
       all.push({ ...f, _module: mod });
     }
@@ -274,37 +325,34 @@ function showScanActive(url) {
 }
 
 function updateDashboardStats(result) {
-  $('#stat-last-critical').textContent = result.critical_count;
-  $('#stat-last-high').textContent = result.high_count;
-  $('#stat-last-total').textContent = result.total_vulnerabilities;
+  const el = (id) => document.getElementById(id);
+  if (el('stat-last-critical')) el('stat-last-critical').textContent = result.critical_count;
+  if (el('stat-last-high'))     el('stat-last-high').textContent     = result.high_count;
+  if (el('stat-last-total'))    el('stat-last-total').textContent    = result.total_vulnerabilities;
 }
 
 /* ══════════════════════════════════════════════
    Results Rendering
    ══════════════════════════════════════════════ */
 function renderResults(result) {
-  // Show content, hide empty state
   $('#results-empty').classList.add('hidden');
   $('#results-content').classList.remove('hidden');
   $('#copy-json-btn').disabled = false;
   $('#download-json-btn').disabled = false;
   $('#results-subtitle').textContent = `Scanned: ${result.url} — ${result.total_vulnerabilities} findings`;
 
-  // Risk badge
   const risk = result.overall_risk || 'info';
   const riskBadge = $('#risk-badge');
   riskBadge.textContent = risk.toUpperCase();
   riskBadge.className = `risk-badge risk-${risk}`;
   $('#risk-url').textContent = result.url;
 
-  // Counts
   $('#count-critical').textContent = result.critical_count || 0;
-  $('#count-high').textContent = result.high_count || 0;
-  $('#count-medium').textContent = result.medium_count || 0;
-  $('#count-low').textContent = result.low_count || 0;
-  $('#count-total').textContent = result.total_vulnerabilities || 0;
+  $('#count-high').textContent     = result.high_count || 0;
+  $('#count-medium').textContent   = result.medium_count || 0;
+  $('#count-low').textContent      = result.low_count || 0;
+  $('#count-total').textContent    = result.total_vulnerabilities || 0;
 
-  // Donut chart
   const chart = new DonutChart('severity-chart', 'chart-legend');
   const counts = countSeverities(state.allFindings);
   chart.draw([
@@ -315,10 +363,7 @@ function renderResults(result) {
     { label: 'Info',     value: counts.info,     color: SEV_COLORS.info },
   ]);
 
-  // Module status list
   renderModuleStatus(result);
-
-  // Findings table
   renderFindingsTable(state.allFindings);
 }
 
@@ -330,7 +375,7 @@ function renderModuleStatus(result) {
   container.innerHTML = mods.map(mod => {
     const data = result.results?.[mod];
     const failed = result.modules_failed?.includes(mod);
-    const findings = data?.findings || [];
+    const findings = Array.isArray(data?.findings) ? data.findings : [];
     const criticalCount = findings.filter(f => (f.severity || '').toLowerCase() === 'critical').length;
     const hasFindings = findings.length > 0;
 
@@ -341,7 +386,6 @@ function renderModuleStatus(result) {
     else if (hasFindings) { badgeClass = 'badge-warn'; badgeText = 'Findings'; }
     else if (data && !failed) { badgeClass = 'badge-ok'; badgeText = 'Clean'; }
 
-    // Special info for some modules
     let extra = '';
     if (mod === 'headers' && data?.summary?.grade) extra = ` · Grade ${data.summary.grade}`;
     if (mod === 'ssl' && data?.summary?.grade) extra = ` · Grade ${data.summary.grade}`;
@@ -375,7 +419,6 @@ function renderFindingsTable(findings, severityFilter = '', moduleFilter = '') {
 
   empty.classList.add('hidden');
 
-  // Sort by severity
   const sevIdx = (s) => SEV_ORDER.indexOf((s || '').toLowerCase());
   filtered.sort((a, b) => sevIdx(a.severity) - sevIdx(b.severity));
 
@@ -396,7 +439,6 @@ function renderFindingsTable(findings, severityFilter = '', moduleFilter = '') {
     `;
   }).join('');
 
-  // Attach detail view listeners
   tbody.querySelectorAll('.details-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -416,7 +458,7 @@ function renderFindingsTable(findings, severityFilter = '', moduleFilter = '') {
 function openFindingModal(finding) {
   const modal = $('#modal-overlay');
   const title = $('#modal-title');
-  const body = $('#modal-body');
+  const body  = $('#modal-body');
   if (!modal || !finding) return;
 
   const sev = (finding.severity || 'info').toLowerCase();
@@ -459,8 +501,8 @@ function exportJSON() {
   if (!state.scanResults) return;
   const json = JSON.stringify(state.scanResults, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
   a.href = url;
   a.download = `websecuity-scan-${Date.now()}.json`;
   a.click();
@@ -505,8 +547,8 @@ const SHORT_MODULE_NAMES = {
 
 async function loadHistory() {
   const loading = $('#history-loading');
-  const empty = $('#history-empty');
-  const list = $('#history-list');
+  const empty   = $('#history-empty');
+  const list    = $('#history-list');
   if (!loading || !list) return;
 
   loading.classList.remove('hidden');
@@ -525,7 +567,6 @@ async function loadHistory() {
     $('#history-subtitle').textContent = `${scans.length} saved scan${scans.length !== 1 ? 's' : ''}`;
     list.innerHTML = scans.map(scan => renderHistoryCard(scan)).join('');
 
-    // Event listeners on cards
     list.querySelectorAll('.history-card').forEach(card => {
       card.addEventListener('click', (e) => {
         if (e.target.closest('.history-delete-btn')) return;
@@ -589,21 +630,23 @@ async function loadHistoryScanResults(scanId) {
       toast('No result data available for this scan.', 'info');
       return;
     }
-    // Reconstruct findings and render results page
-    const results = detail.result_json;
-    const allFindings = buildFindingsList(results, detail.modules_run || []);
+    const results    = detail.result_json;
+    const moduleList = detail.modules_run || Object.keys(results);
+    const allFindings = buildFindingsList(results, moduleList);
+    const counts = countSeverities(allFindings);
+
     const result = {
       url: detail.target_url,
-      modules_requested: detail.modules_run || [],
-      modules_completed: detail.modules_run || [],
+      modules_requested: moduleList,
+      modules_completed: moduleList,
       modules_failed: [],
       results,
-      total_vulnerabilities: detail.total_findings,
-      critical_count: detail.critical_count,
-      high_count: detail.high_count,
-      medium_count: detail.medium_count,
-      low_count: detail.low_count,
-      overall_risk: detail.risk_level || 'info',
+      total_vulnerabilities: detail.total_findings ?? allFindings.length,
+      critical_count: detail.critical_count ?? counts.critical,
+      high_count:     detail.high_count ?? counts.high,
+      medium_count:   detail.medium_count ?? counts.medium,
+      low_count:      detail.low_count ?? counts.low,
+      overall_risk:   detail.risk_level || topRisk(counts),
     };
     state.scanResults = result;
     state.allFindings = allFindings;
@@ -619,7 +662,6 @@ async function loadHistoryScanResults(scanId) {
    Init
    ══════════════════════════════════════════════ */
 function init() {
-  // Expose navigate for inline events
   window.app = { navigate, loadHistory };
 
   // Nav links — guard history behind login
@@ -649,8 +691,34 @@ function init() {
     card.addEventListener('click', () => navigate('scanner'));
   });
 
-  // Launch scan button
+  // ── Wizard navigation ──
+  // Step 1 → Step 2 (Next button)
+  $('#wizard-next-1')?.addEventListener('click', () => {
+    const url = $('#target-url').value.trim();
+    if (!url) { toast('Please enter a target URL.', 'error'); $('#target-url').focus(); return; }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      toast('URL must start with http:// or https://', 'error');
+      return;
+    }
+    goToStep(2);
+  });
+
+  // Step 2 → Step 1 (Back)
+  $('#wizard-back-2')?.addEventListener('click', () => goToStep(1));
+
+  // Step 3 → Step 2 (Back — only allowed when not scanning)
+  $('#wizard-back-3')?.addEventListener('click', () => {
+    if (!state.scanning) goToStep(2);
+  });
+
+  // Launch Scan button (on step 2)
   $('#launch-scan-btn')?.addEventListener('click', launchScan);
+
+  // Crawler toggle
+  $$('input[name="crawler-toggle"]').forEach(radio => {
+    radio.addEventListener('change', updateCrawlerControls);
+  });
+  updateCrawlerControls();
 
   // New scan button
   $('#new-scan-btn')?.addEventListener('click', () => navigate('scanner'));
@@ -666,35 +734,24 @@ function init() {
   const selectAll = $('#select-all');
   selectAll?.addEventListener('change', () => {
     $$('input[name="module"]').forEach(cb => cb.checked = selectAll.checked);
-    $$('.module-checkbox').forEach(cb => {
-      if (selectAll.checked) cb.style.borderColor = 'rgba(0, 212, 255, 0.4)';
-    });
   });
 
   // Sync select-all when individual checkboxes change
   $$('input[name="module"]').forEach(cb => {
     cb.addEventListener('change', () => {
-      const all = $$('input[name="module"]');
+      const all     = $$('input[name="module"]');
       const checked = all.filter(c => c.checked);
-      selectAll.checked = checked.length === all.length;
+      selectAll.checked       = checked.length === all.length;
       selectAll.indeterminate = checked.length > 0 && checked.length < all.length;
     });
   });
 
   // Findings filters
   $('#filter-severity')?.addEventListener('change', () => {
-    renderFindingsTable(
-      state.allFindings,
-      $('#filter-severity').value,
-      $('#filter-module').value
-    );
+    renderFindingsTable(state.allFindings, $('#filter-severity').value, $('#filter-module').value);
   });
   $('#filter-module')?.addEventListener('change', () => {
-    renderFindingsTable(
-      state.allFindings,
-      $('#filter-severity').value,
-      $('#filter-module').value
-    );
+    renderFindingsTable(state.allFindings, $('#filter-severity').value, $('#filter-module').value);
   });
 
   // Modal close
@@ -710,6 +767,9 @@ function init() {
   $('#menu-btn')?.addEventListener('click', () => {
     $('#sidebar').classList.toggle('open');
   });
+
+  // Initialise wizard at step 1
+  goToStep(1);
 
   // Check server health
   checkServerStatus();

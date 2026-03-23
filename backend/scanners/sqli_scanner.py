@@ -286,20 +286,22 @@ async def test_time_based(
 # Main Scanner Entry Point
 # ──────────────────────────────────────────────
 
-async def run_sqli_scan(url: str, timeout: int = 10) -> dict:
+async def run_sqli_scan(urls: List[str], timeout: int = 10) -> dict:
     """
-    Run a full SQL injection scan against all parameters in the given URL.
+    Run a full SQL injection scan against all parameters in the given URLs.
     Returns a dict compatible with ScanResult model.
     """
     findings: List[VulnerabilityFinding] = []
     errors: List[str] = []
     payloads_tested: List[str] = []
 
-    params = extract_parameters(url)
-    if not params:
+    if isinstance(urls, str):
+        urls = [urls]
+        
+    if not urls:
         return {
-            "url": url,
-            "status": "no_parameters",
+            "url": "none",
+            "status": "completed",
             "summary": ScanSummary(
                 total_parameters=0,
                 total_payloads_tested=0,
@@ -307,51 +309,52 @@ async def run_sqli_scan(url: str, timeout: int = 10) -> dict:
                 risk_level=SeverityLevel.LOW,
             ),
             "findings": [],
-            "errors": ["No query parameters found in the URL to test."],
+            "errors": ["No URLs provided to test."],
         }
+        
+    primary_url = urls[0]
+    total_params = 0
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Get baseline response
-        try:
-            baseline = await client.get(url, timeout=timeout)
-            baseline_length = len(baseline.text)
-        except Exception as e:
-            return {
-                "url": url,
-                "status": "unreachable",
-                "summary": ScanSummary(
-                    total_parameters=len(params),
-                    total_payloads_tested=0,
-                    vulnerabilities_found=0,
-                    risk_level=SeverityLevel.LOW,
-                ),
-                "findings": [],
-                "errors": [f"Could not reach target URL: {str(e)}"],
-            }
+        for url in urls:
+            params = extract_parameters(url)
+            if not params:
+                continue
+            
+            total_params += len(params)
 
-        # Test each parameter
-        for param in params:
-            await test_error_based(client, url, param, timeout, findings, errors, payloads_tested)
-            await test_boolean_based(client, url, param, timeout, findings, errors, payloads_tested, baseline_length)
-            await test_time_based(client, url, param, timeout, findings, errors, payloads_tested)
+            # Get baseline response
+            try:
+                baseline = await client.get(url, timeout=timeout)
+                baseline_length = len(baseline.text)
+            except Exception as e:
+                errors.append(f"Could not reach target URL {url}: {str(e)}")
+                continue
 
-    # Deduplicate findings by parameter
-    seen_params = set()
+            # Test each parameter
+            for param in params:
+                await test_error_based(client, url, param, timeout, findings, errors, payloads_tested)
+                await test_boolean_based(client, url, param, timeout, findings, errors, payloads_tested, baseline_length)
+                await test_time_based(client, url, param, timeout, findings, errors, payloads_tested)
+
+    # Deduplicate findings by parameter and url
+    seen = set()
     unique_findings = []
     for f in findings:
-        if f.parameter not in seen_params:
+        key = (f.parameter, f.payload)
+        if key not in seen:
             unique_findings.append(f)
-            seen_params.add(f.parameter)
+            seen.add(key)
 
     summary = ScanSummary(
-        total_parameters=len(params),
+        total_parameters=total_params,
         total_payloads_tested=len(payloads_tested),
         vulnerabilities_found=len(unique_findings),
         risk_level=calculate_risk(unique_findings),
     )
 
     return {
-        "url": url,
+        "url": primary_url,
         "status": "completed",
         "summary": summary,
         "findings": unique_findings,

@@ -25,83 +25,32 @@ class API {
     return res.json();
   }
 
-
   // ── Health ────────────────────────────────────
   async health() {
     return this._fetch('GET', '/health');
   }
 
-  // ── Crawler ──────────────────────────────────
-  async crawlAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/crawler/scan/async', { url, timeout, max_depth: 2, max_pages: 20 });
-  }
-  async getCrawlResult(jobId) {
-    return this._fetch('GET', `/api/crawler/scan/${jobId}`);
-  }
-
-  // ── SQL Injection ────────────────────────────
-  async sqliAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/sqli/scan/async', { url, timeout });
-  }
-  async getSqliResult(jobId) {
-    return this._fetch('GET', `/api/sqli/scan/${jobId}`);
-  }
-
-  // ── XSS ─────────────────────────────────────
-  async xssAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/xss/scan/async', {
-      url, timeout, test_forms: true, test_headers: true, test_json: true
-    });
-  }
-  async getXssResult(jobId) {
-    return this._fetch('GET', `/api/xss/scan/${jobId}`);
-  }
-
-  // ── Broken Access Control ────────────────────
-  async bacAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/bac/scan/async', { url, timeout });
-  }
-  async getBacResult(jobId) {
-    return this._fetch('GET', `/api/bac/scan/${jobId}`);
-  }
-
-  // ── Auth & Session ───────────────────────────
-  async authAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/auth/scan/async', {
-      url, timeout, login_path: null, username_field: 'username', password_field: 'password'
-    });
-  }
-  async getAuthResult(jobId) {
-    return this._fetch('GET', `/api/auth/scan/${jobId}`);
-  }
-
-  // ── SSL/TLS ──────────────────────────────────
-  async sslAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/ssl/scan/async', { url, timeout });
-  }
-  async getSslResult(jobId) {
-    return this._fetch('GET', `/api/ssl/scan/${jobId}`);
-  }
-
-  // ── HTTP Headers ─────────────────────────────
-  async headersAsync(url, timeout = 15) {
-    return this._fetch('POST', '/api/headers/scan/async', { url, timeout, follow_redirects: true });
-  }
-  async getHeadersResult(jobId) {
-    return this._fetch('GET', `/api/headers/scan/${jobId}`);
-  }
-
-  // ── Unified Scan ─────────────────────────────
-  async unifiedAsync(url, modules, timeout = 15) {
-    return this._fetch('POST', '/api/scan/async', { url, modules, timeout });
-  }
-  async getUnifiedResult(jobId) {
-    return this._fetch('GET', `/api/scan/${jobId}`);
-  }
-
   // ── History Save ───────────────────────────
   async saveScanHistory(scanResult) {
     return this._fetch('POST', '/api/history/save', scanResult);
+  }
+
+  // ── Unified Scan ─────────────────────────────
+  async unifiedScanAsync(url, modules = [], timeout = 15, crawlerConfig = {}) {
+    const payload = {
+      url,
+      modules,
+      timeout: parseInt(timeout),
+      use_crawler: crawlerConfig.use_crawler !== false,
+      max_depth: crawlerConfig.max_depth || 2,
+      max_pages: crawlerConfig.max_pages || 20,
+      scan_all_links: crawlerConfig.scan_all_links !== false,
+    };
+    return this._fetch('POST', '/api/scan/async', payload);
+  }
+
+  async getUnifiedScanResult(jobId) {
+    return this._fetch('GET', `/api/scan/${jobId}`);
   }
 
   // ── Poll helper ──────────────────────────────
@@ -150,53 +99,35 @@ class API {
   }
 
   /**
-   * Run multiple scanner modules individually with per-module polling.
-   * Calls onModuleDone(moduleName, result) as each finishes.
+   * Run multiple scanner modules via the Unified DAST Pipeline.
+   * @param {string} url - Target URL
+   * @param {string[]} modules - List of module IDs
+   * @param {number} timeout - Per-module timeout in seconds
+   * @param {object} crawlerConfig - { use_crawler, max_depth, max_pages, scan_all_links }
+   * @param {Function} onProgress - Called with progress percentage 0-100
+   * @returns {object} Map of moduleName -> moduleResult
    */
-  async runModules(url, modules, timeout, onModuleDone = () => {}, onProgress = () => {}) {
-    const total = modules.length;
-    let done = 0;
-    const results = {};
+  async runModules(url, modules, timeout, crawlerConfig = {}, onProgress = () => {}) {
+    onProgress(10);
 
-    const runOne = async (mod) => {
-      let jobId;
-      try {
-        let job;
-        if (mod === 'crawler') job = await this.crawlAsync(url, timeout);
-        else if (mod === 'sqli') job = await this.sqliAsync(url, timeout);
-        else if (mod === 'xss') job = await this.xssAsync(url, timeout);
-        else if (mod === 'bac') job = await this.bacAsync(url, timeout);
-        else if (mod === 'auth') job = await this.authAsync(url, timeout);
-        else if (mod === 'ssl') job = await this.sslAsync(url, timeout);
-        else if (mod === 'headers') job = await this.headersAsync(url, timeout);
+    // 1. Kick off unified scan
+    const job = await this.unifiedScanAsync(url, modules, timeout, crawlerConfig);
+    const jobId = job.job_id;
 
-        jobId = job.job_id;
+    onProgress(25);
 
-        const pollFns = {
-          crawler: (id) => this.getCrawlResult(id),
-          sqli: (id) => this.getSqliResult(id),
-          xss: (id) => this.getXssResult(id),
-          bac: (id) => this.getBacResult(id),
-          auth: (id) => this.getAuthResult(id),
-          ssl: (id) => this.getSslResult(id),
-          headers: (id) => this.getHeadersResult(id),
-        };
+    // 2. Poll until complete
+    const pollResult = await this.poll(
+      () => this.getUnifiedScanResult(jobId),
+      onProgress,
+      88
+    );
 
-        const result = await this.poll(() => pollFns[mod](jobId));
-        results[mod] = result;
-        done++;
-        onProgress(Math.round((done / total) * 100));
-        onModuleDone(mod, result, null);
-      } catch (err) {
-        results[mod] = { error: err.message };
-        done++;
-        onProgress(Math.round((done / total) * 100));
-        onModuleDone(mod, null, err.message);
-      }
-    };
+    onProgress(100);
 
-    await Promise.all(modules.map(runOne));
-    return results;
+    // 3. Return results keyed by module name
+    const uResult = pollResult || {};
+    return uResult;
   }
 }
 

@@ -996,7 +996,7 @@ async def test_multi_session(
 # ──────────────────────────────────────────────
 
 async def run_auth_scan(
-    url: str,
+    urls: List[str],
     login_path: str = "/login",
     username_field: str = "username",
     password_field: str = "password",
@@ -1011,7 +1011,27 @@ async def run_auth_scan(
     cookie_details: List[CookieDetail] = []
     token_analysis: List[TokenEntropyDetail] = []
 
-    base_url = get_base_url(url)
+    if isinstance(urls, str):
+        urls = [urls]
+
+    if not urls:
+        return {
+            "url": "none",
+            "status": "completed",
+            "summary": AuthSummary(
+                total_checks=0, vulnerabilities_found=0,
+                weak_credentials=0, session_issues=0,
+                cookie_issues=0, lockout_issues=0,
+                policy_issues=0, risk_level=SeverityLevel.LOW,
+            ),
+            "findings": [],
+            "cookie_details": [],
+            "token_analysis": [],
+            "errors": ["No URLs provided to test."],
+        }
+        
+    primary_url = urls[0]
+    base_url = get_base_url(primary_url)
     login_url = base_url + login_path
 
     async with httpx.AsyncClient(
@@ -1022,10 +1042,10 @@ async def run_auth_scan(
     ) as client:
         # Verify target reachable
         try:
-            await client.get(url, timeout=timeout)
+            await client.get(primary_url, timeout=timeout)
         except Exception as e:
             return {
-                "url": url,
+                "url": primary_url,
                 "status": "unreachable",
                 "summary": AuthSummary(
                     total_checks=0, vulnerabilities_found=0,
@@ -1067,21 +1087,21 @@ async def run_auth_scan(
                 timeout, findings, errors, checks
             ),
             test_cookie_flags(
-                client, url, best_login_url, best_form,
+                client, primary_url, best_login_url, best_form,
                 username_field, password_field,
                 timeout, findings, errors, checks, cookie_details
             ),
             test_session_token_entropy(
-                client, url, best_login_url,
+                client, primary_url, best_login_url,
                 timeout, findings, errors, checks, token_analysis
             ),
             test_session_fixation(
-                client, url, best_login_url, best_form,
+                client, primary_url, best_login_url, best_form,
                 username_field, password_field,
                 timeout, findings, errors, checks
             ),
             test_token_expiry(
-                client, url, best_login_url, best_form,
+                client, primary_url, best_login_url, best_form,
                 username_field, password_field,
                 timeout, findings, errors, checks
             ),
@@ -1090,7 +1110,7 @@ async def run_auth_scan(
                 timeout, findings, errors, checks
             ),
             test_multi_session(
-                client, url, best_login_url, best_form,
+                client, primary_url, best_login_url, best_form,
                 username_field, password_field,
                 timeout, findings, errors, checks
             ),
@@ -1120,7 +1140,7 @@ async def run_auth_scan(
     )
 
     return {
-        "url": url,
+        "url": primary_url,
         "status": "completed",
         "summary": summary,
         "findings": unique_findings,
