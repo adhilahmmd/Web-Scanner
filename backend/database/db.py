@@ -6,14 +6,23 @@ Uses SQLite stored at <backend_root>/websecuity.db
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 import os
+from dotenv import load_dotenv
 
-# Place the DB file next to main.py
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'websecuity.db')}"
+load_dotenv()
+
+# Load MySQL configuration from .env, or use default local credentials
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
+MYSQL_DB = os.getenv("MYSQL_DB", "websecurity")
+
+DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},  # required for SQLite + FastAPI
+    # pool_pre_ping=True is recommended for MySQL to handle dropped connections
+    pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

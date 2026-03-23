@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from routers import sqli, crawler, xss, bac, auth, ssl, http
 from routers import scan
 from routers import users, history
@@ -46,6 +46,10 @@ app.include_router(history.router, prefix="/api/history", tags=["Scan History"])
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(content=b"", media_type="image/x-icon")
 
 
 # Serve frontend static files (must be after API routes)

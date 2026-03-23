@@ -99,6 +99,11 @@ class API {
     return this._fetch('GET', `/api/scan/${jobId}`);
   }
 
+  // ── History Save ───────────────────────────
+  async saveScanHistory(scanResult) {
+    return this._fetch('POST', '/api/history/save', scanResult);
+  }
+
   // ── Poll helper ──────────────────────────────
   /**
    * Poll a job endpoint until completion.

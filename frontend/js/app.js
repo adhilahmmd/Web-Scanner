@@ -206,7 +206,9 @@ async function launchScan() {
       renderResults(result);
       navigate('results');
       if (window.auth?.isLoggedIn()) {
-        toast('Scan complete! Results saved to your history.', 'success');
+        window.api.saveScanHistory(result)
+          .then(() => toast('Scan complete! Results saved to your history.', 'success'))
+          .catch(err => toast('Scan complete, but saving to history failed: ' + err.message, 'error'));
       } else {
         toast('Scan complete!', 'success');
       }

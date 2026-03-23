@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from core.dependencies import get_db, get_current_user
 from database.models import User, ScanResult
+from routers.scan import UnifiedScanResult
 
 router = APIRouter()
 
@@ -108,3 +109,27 @@ def delete_scan(
         raise HTTPException(status_code=404, detail="Scan not found.")
     db.delete(scan)
     db.commit()
+
+@router.post("/save", response_model=ScanSummary, summary="Save an aggregated scan result from frontend")
+def save_scan(
+    result: UnifiedScanResult,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    scan = ScanResult(
+        user_id=current_user.id,
+        target_url=result.url,
+        modules_run=json.dumps(result.modules_requested),
+        result_json=json.dumps(result.results),
+        risk_level=result.overall_risk,
+        critical_count=result.critical_count,
+        high_count=result.high_count,
+        medium_count=result.medium_count,
+        low_count=result.low_count,
+        total_findings=result.total_vulnerabilities,
+        scan_duration=0,
+    )
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    return _scan_to_summary(scan)

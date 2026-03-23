@@ -719,7 +719,7 @@ body {
 /* ── Results: Summary ───────────────────────── */
 .summary-grid {
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
+  grid-template-columns: minmax(320px, 2.5fr) 1fr 1fr 1fr 1fr 1fr;
   gap: 16px;
   margin-bottom: 24px;
 }
@@ -744,13 +744,14 @@ body {
   justify-content: flex-start;
 }
 .risk-badge {
-  font-size: 32px;
+  font-size: 24px;
   font-weight: 900;
   font-family: 'JetBrains Mono', monospace;
-  padding: 8px 20px;
+  padding: 8px 16px;
   border-radius: 10px;
   min-width: 80px;
   text-align: center;
+  flex-shrink: 0;
 }
 .risk-badge.risk-critical { background: var(--sev-critical-dim); color: var(--sev-critical); border: 1px solid rgba(255,45,85,0.3); }
 .risk-badge.risk-high { background: var(--sev-high-dim); color: var(--sev-high); border: 1px solid rgba(255,107,53,0.3); }
@@ -758,6 +759,12 @@ body {
 .risk-badge.risk-low { background: var(--sev-low-dim); color: var(--sev-low); border: 1px solid rgba(52,199,89,0.3); }
 .risk-badge.risk-info { background: var(--sev-info-dim); color: var(--text-secondary); border: 1px solid var(--border); }
 
+.risk-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
 .risk-label { font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
 .risk-url { font-size: 13px; color: var(--text-secondary); word-break: break-all; }
 
@@ -784,7 +791,7 @@ body {
 /* ── Chart Row ──────────────────────────────── */
 .chart-row {
   display: grid;
-  grid-template-columns: 300px 1fr;
+  grid-template-columns: 380px 1fr;
   gap: 24px;
   margin-bottom: 24px;
 }
