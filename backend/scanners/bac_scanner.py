@@ -17,6 +17,7 @@ Bypass techniques:
 
 import httpx
 import asyncio
+import uuid
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from typing import List, Dict, Tuple, Optional
 from models.bac_models import (
@@ -152,9 +153,26 @@ def has_sensitive_content(body: str) -> Tuple[bool, str]:
     return False, ""
 
 
-def significant_body_diff(body_a: str, body_b: str, threshold: int = 200) -> bool:
-    """Return True if two response bodies differ by more than `threshold` bytes."""
-    return abs(len(body_a) - len(body_b)) > threshold
+def significant_body_diff(body_a: str, body_b: str, threshold: int = 200, percentage: float = 0.05) -> bool:
+    """
+    Return True if two response bodies differ by more than `threshold` bytes OR 
+    if their lengths differ by more than `percentage` % of the larger body.
+    This helps detect SPA catch-all pages that inject slight token/ad differences.
+    """
+    len_a = len(body_a)
+    len_b = len(body_b)
+    diff = abs(len_a - len_b)
+    
+    # If the byte difference is small, it's NOT a significant change
+    if diff <= threshold:
+        return False
+        
+    # Check if the difference is beyond the percentage tolerance
+    max_len = max(len_a, len_b, 1) # avoid div by zero
+    if (diff / max_len) > percentage:
+        return True
+        
+    return False
 
 
 def calculate_risk(findings: List[BACFinding]) -> SeverityLevel:
@@ -268,6 +286,8 @@ async def test_forced_browsing(
     findings: List[BACFinding],
     errors: List[str],
     checks: List[str],
+    catch_all_status: int = 404,
+    catch_all_body: str = "",
 ):
     base_url = get_base_url(url)
 
@@ -280,6 +300,10 @@ async def test_forced_browsing(
             try:
                 resp = await client.get(target, timeout=timeout)
                 if resp.status_code == 200 and len(resp.text) > 200:
+                    # SPA Catch-All check
+                    if catch_all_status == 200 and not significant_body_diff(resp.text, catch_all_body):
+                        return
+
                     sensitive, evidence = has_sensitive_content(resp.text)
                     content_type = resp.headers.get("content-type", "")
                     is_json_data = "application/json" in content_type
@@ -543,6 +567,8 @@ async def test_missing_auth(
     findings: List[BACFinding],
     errors: List[str],
     checks: List[str],
+    catch_all_status: int = 404,
+    catch_all_body: str = "",
 ):
     base_url = get_base_url(url)
 
@@ -572,8 +598,19 @@ async def test_missing_auth(
                     timeout=timeout,
                 )
                 if resp.status_code == 200 and len(resp.text) > 100:
+                    # Check for catch_all
+                    if catch_all_status == 200 and not significant_body_diff(resp.text, catch_all_body):
+                        return
+                        
                     content_type = resp.headers.get("content-type", "")
-                    is_data = "application/json" in content_type or len(resp.text) > 500
+                    # Require JSON for missing auth on API paths to avoid HTML fallback false positives
+                    is_data = "application/json" in content_type
+                    # Exclude standard JSON errors that return 200
+                    if is_data and ("error" in resp.text.lower() or "unauthorized" in resp.text.lower()):
+                        # Quick check: often APIs return {error: "unauthorized"} but status 200
+                        if "admin" not in resp.text.lower() and "token" not in resp.text.lower():
+                            is_data = False
+
                     if is_data:
                         findings.append(BACFinding(
                             check_type=BACType.MISSING_AUTH,
@@ -618,6 +655,7 @@ async def test_method_tampering(
     try:
         baseline = await client.get(url, timeout=timeout)
         baseline_status = baseline.status_code
+        baseline_body = baseline.text
     except Exception as e:
         errors.append(f"Method tamper baseline failed: {str(e)}")
         return
@@ -630,6 +668,10 @@ async def test_method_tampering(
             try:
                 resp = await client.request(m, url, timeout=timeout)
                 if resp.status_code == 200 and m in ("DELETE", "PUT"):
+                    # Check if the server just ignored the method and returned the GET baseline
+                    if not significant_body_diff(resp.text, baseline_body):
+                        return
+                        
                     findings.append(BACFinding(
                         check_type=BACType.METHOD_TAMPERING,
                         bypass_technique=BypassTechnique.URL_MANIPULATION,
@@ -666,6 +708,10 @@ async def test_method_tampering(
                     timeout=timeout,
                 )
                 if override_resp.status_code == 200:
+                    # Verify it wasn't just a standard POST ignoring the override
+                    if not significant_body_diff(override_resp.text, baseline_body):
+                        return
+                        
                     findings.append(BACFinding(
                         check_type=BACType.METHOD_TAMPERING,
                         bypass_technique=BypassTechnique.HEADER_BYPASS,
@@ -707,10 +753,19 @@ async def test_header_bypass(
     findings: List[BACFinding],
     errors: List[str],
     checks: List[str],
+    catch_all_status: int = 404,
+    catch_all_body: str = "",
 ):
     base_url = get_base_url(url)
     parsed = urlparse(url)
     path = parsed.path or "/"
+
+    # Fetch baseline for exact URL to compare
+    try:
+        baseline_resp = await client.get(url, timeout=timeout)
+        baseline_body = baseline_resp.text
+    except Exception:
+        baseline_body = ""
 
     # Test bypass headers against admin-like paths
     test_paths = ["/admin", "/dashboard", "/api/admin"]
@@ -733,6 +788,11 @@ async def test_header_bypass(
                     timeout=timeout,
                 )
                 if resp.status_code == 200 and len(resp.text) > 300:
+                    if catch_all_status == 200 and not significant_body_diff(resp.text, catch_all_body):
+                        return
+                    if not significant_body_diff(resp.text, baseline_body):
+                        return
+
                     sensitive, evidence = has_sensitive_content(resp.text)
                     if sensitive:
                         findings.append(BACFinding(
@@ -810,6 +870,7 @@ async def run_bac_scan(
         }
 
     primary_url = urls[0]
+    base_url = get_base_url(primary_url)
 
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -827,15 +888,25 @@ async def run_bac_scan(
         except Exception as e:
             errors.append(f"Primary URL probe failed (continuing scan): {str(e)}")
 
+        # Fetch Catch-All Baseline (to detect SPAs that return 200 for 404s)
+        try:
+            catch_all_url = urljoin(base_url, f"/does-not-exist-{uuid.uuid4().hex[:8]}")
+            catch_all_probe = await client.get(catch_all_url, timeout=timeout)
+            catch_all_status = catch_all_probe.status_code
+            catch_all_body = catch_all_probe.text
+        except Exception:
+            catch_all_status = 404
+            catch_all_body = ""
+
         # Run testing for all URLs concurrently within limits
         for url in urls:
             await asyncio.gather(
                 test_idor(client, url, timeout, findings, errors, checks),
-                test_forced_browsing(client, url, timeout, findings, errors, checks),
+                test_forced_browsing(client, url, timeout, findings, errors, checks, catch_all_status, catch_all_body),
                 test_privilege_escalation(client, url, timeout, findings, errors, checks),
-                test_missing_auth(client, url, timeout, findings, errors, checks),
+                test_missing_auth(client, url, timeout, findings, errors, checks, catch_all_status, catch_all_body),
                 test_method_tampering(client, url, timeout, findings, errors, checks),
-                test_header_bypass(client, url, timeout, findings, errors, checks),
+                test_header_bypass(client, url, timeout, findings, errors, checks, catch_all_status, catch_all_body),
             )
 
     # Deduplicate by (check_type, target_url, parameter, tampered_value)
