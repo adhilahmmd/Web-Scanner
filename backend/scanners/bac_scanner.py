@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from typing import List, Dict, Tuple, Optional
 from models.bac_models import (
     BACFinding, BACSummary, SeverityLevel,
-    BACType, BypassTechnique
+    BACType, BypassTechnique, ConfidenceLevel
 )
 
 
@@ -119,39 +119,42 @@ def get_base_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def is_sensitive_response(status: int, original_status: int, body: str) -> Tuple[bool, str]:
-    """Determine if a response indicates unauthorized access."""
-    # Only signal status-change bypass when we actually verified original was blocked
-    if original_status in (401, 403) and status == 200:
-        return True, f"Status changed from {original_status} → 200 (bypass successful)"
+# Sensitive keywords that indicate real privileged content
+SENSITIVE_KEYWORDS = [
+    "admin", "dashboard", "control panel", "manage users",
+    "system settings", "user list", "delete user",
+    "config", "secret", "private", "internal",
+    "password", "credential", "token", "api_key",
+]
 
-    sensitive_keywords = [
-        "admin", "dashboard", "control panel", "manage users",
-        "system settings", "user list", "delete user",
-        "config", "secret", "private", "internal",
-        "password", "credential", "token", "api_key",
-    ]
+
+def is_sensitive_response(status: int, original_status: int, body: str) -> Tuple[bool, str, ConfidenceLevel]:
+    """Determine if a response indicates unauthorized access and assign confidence."""
     lower_body = body.lower()
-    for kw in sensitive_keywords:
-        if kw in lower_body and status == 200:
-            return True, f"Sensitive keyword '{kw}' found in accessible response"
+    has_kw = any(kw in lower_body for kw in SENSITIVE_KEYWORDS)
 
-    return False, ""
+    # Strongest signal: status changed from blocked to 200 + sensitive content
+    if original_status in (401, 403) and status == 200:
+        if has_kw:
+            kw = next(kw for kw in SENSITIVE_KEYWORDS if kw in lower_body)
+            return True, f"Status changed {original_status}→200 + sensitive keyword '{kw}' found", ConfidenceLevel.HIGH
+        return True, f"Status changed from {original_status}→200 (bypass confirmed)", ConfidenceLevel.MEDIUM
+
+    return False, "", ConfidenceLevel.LOW
 
 
 def has_sensitive_content(body: str) -> Tuple[bool, str]:
     """Check if a response body contains sensitive keywords (no status-change assumption)."""
-    sensitive_keywords = [
-        "admin", "dashboard", "control panel", "manage users",
-        "system settings", "user list", "delete user",
-        "config", "secret", "private", "internal",
-        "password", "credential", "token", "api_key",
-    ]
     lower_body = body.lower()
-    for kw in sensitive_keywords:
+    for kw in SENSITIVE_KEYWORDS:
         if kw in lower_body:
             return True, f"Sensitive keyword '{kw}' found in accessible response"
     return False, ""
+
+
+def significant_body_diff(body_a: str, body_b: str, threshold: int = 200) -> bool:
+    """Return True if two response bodies differ by more than `threshold` bytes."""
+    return abs(len(body_a) - len(body_b)) > threshold
 
 
 def calculate_risk(findings: List[BACFinding]) -> SeverityLevel:
@@ -278,27 +281,35 @@ async def test_forced_browsing(
                 resp = await client.get(target, timeout=timeout)
                 if resp.status_code == 200 and len(resp.text) > 200:
                     sensitive, evidence = has_sensitive_content(resp.text)
-                    findings.append(BACFinding(
-                        check_type=BACType.FORCED_BROWSING,
-                        bypass_technique=BypassTechnique.URL_MANIPULATION,
-                        target_url=target,
-                        method="GET",
-                        evidence=(
-                            evidence or
-                            f"Restricted path '{restricted_path}' returned HTTP 200 "
-                            f"({len(resp.text)} bytes) without authentication"
-                        ),
-                        severity=SeverityLevel.HIGH,
-                        description=(
-                            f"The path '{restricted_path}' is accessible without authentication. "
-                            f"This may expose administrative functionality or sensitive data."
-                        ),
-                        remediation=(
-                            "Implement proper authentication and authorization on all restricted endpoints. "
-                            "Use a centralized access control middleware. "
-                            "Return 401/403 for unauthenticated/unauthorized access — never 200."
-                        ),
-                    ))
+                    content_type = resp.headers.get("content-type", "")
+                    is_json_data = "application/json" in content_type
+
+                    # Only flag if we have meaningful evidence: sensitive content OR JSON data response
+                    if sensitive or is_json_data:
+                        confidence = ConfidenceLevel.HIGH if sensitive else ConfidenceLevel.MEDIUM
+                        severity = SeverityLevel.HIGH if sensitive else SeverityLevel.MEDIUM
+                        findings.append(BACFinding(
+                            check_type=BACType.FORCED_BROWSING,
+                            bypass_technique=BypassTechnique.URL_MANIPULATION,
+                            target_url=target,
+                            method="GET",
+                            evidence=(
+                                evidence or
+                                f"Restricted path '{restricted_path}' returned HTTP 200 with JSON data "
+                                f"({len(resp.text)} bytes) without authentication"
+                            ),
+                            severity=severity,
+                            confidence=confidence,
+                            description=(
+                                f"The path '{restricted_path}' is accessible without authentication. "
+                                f"This may expose administrative functionality or sensitive data."
+                            ),
+                            remediation=(
+                                "Implement proper authentication and authorization on all restricted endpoints. "
+                                "Use a centralized access control middleware. "
+                                "Return 401/403 for unauthenticated/unauthorized access — never 200."
+                            ),
+                        ))
                 elif resp.status_code == 403:
                     await test_path_bypass(
                         client, base_url, restricted_path,
@@ -378,6 +389,19 @@ async def test_privilege_escalation(
 
     semaphore = asyncio.Semaphore(5)
 
+    # Fetch baseline for content comparison
+    try:
+        baseline_resp = await client.get(url, timeout=timeout)
+        baseline_body = baseline_resp.text
+        baseline_status = baseline_resp.status_code
+    except Exception as e:
+        errors.append(f"Privilege escalation baseline failed: {str(e)}")
+        baseline_body = ""
+        baseline_status = 200
+
+    # Grouped param findings: param_name -> list of working payloads
+    param_hits: Dict[str, list] = {}
+
     async def _test_role_param(rp, rv):
         async with semaphore:
             tampered_url = inject_param(url, rp, rv)
@@ -385,41 +409,60 @@ async def test_privilege_escalation(
                 resp = await client.get(tampered_url, timeout=timeout)
                 if resp.status_code == 200:
                     sensitive, evidence = has_sensitive_content(resp.text)
-                    if sensitive:
-                        findings.append(BACFinding(
-                            check_type=BACType.PRIVILEGE_ESCALATION,
-                            bypass_technique=BypassTechnique.PARAM_TAMPER,
-                            target_url=tampered_url,
-                            method="GET",
-                            parameter=rp,
-                            original_value="user",
-                            tampered_value=rv,
-                            evidence=evidence,
-                            severity=SeverityLevel.CRITICAL,
-                            description=(
-                                f"Adding/modifying the '{rp}={rv}' URL parameter "
-                                f"granted elevated access. The server trusts client-supplied role values."
-                            ),
-                            remediation=(
-                                "Never trust client-supplied role or privilege parameters. "
-                                "Store and verify roles server-side (session/JWT). "
-                                "Implement Role-Based Access Control (RBAC) at the server layer."
-                            ),
-                        ))
-                        return True
+                    body_changed = significant_body_diff(resp.text, baseline_body)
+                    # Require BOTH sensitive content AND a meaningful body change
+                    if sensitive and body_changed:
+                        if rp not in param_hits:
+                            param_hits[rp] = []
+                        param_hits[rp].append((rv, evidence))
             except Exception as e:
                 errors.append(f"Privilege escalation test error: {str(e)}")
-            return False
 
     role_param_tasks = []
     for role_param in ROLE_PARAMS:
         for role_value in ROLE_VALUES[:4]:
             role_param_tasks.append(_test_role_param(role_param, role_value))
-    
+
     await asyncio.gather(*role_param_tasks)
 
+    # Emit one grouped finding per vulnerable parameter
+    for rp, hits in param_hits.items():
+        payloads = [h[0] for h in hits]
+        first_evidence = hits[0][1]
+        findings.append(BACFinding(
+            check_type=BACType.PRIVILEGE_ESCALATION,
+            bypass_technique=BypassTechnique.PARAM_TAMPER,
+            target_url=url,
+            method="GET",
+            parameter=rp,
+            original_value="user",
+            tampered_value=payloads[0],
+            payloads_tested=payloads,
+            evidence=(
+                f"{first_evidence} — {len(payloads)} payload(s) confirmed: "
+                + ", ".join(f"{rp}={v}" for v in payloads)
+            ),
+            severity=SeverityLevel.CRITICAL,
+            confidence=ConfidenceLevel.HIGH,
+            description=(
+                f"The URL parameter '{rp}' can be set to elevated values to gain privileged access. "
+                f"{len(payloads)} payload(s) confirmed: {', '.join(payloads)}. "
+                f"The server trusts client-supplied role values."
+            ),
+            remediation=(
+                "Never trust client-supplied role or privilege parameters. "
+                "Store and verify roles server-side (session/JWT). "
+                "Implement Role-Based Access Control (RBAC) at the server layer."
+            ),
+        ))
+
     # Test cookie/token role manipulation
+    # Use the real baseline fetched above for accurate status comparison
     original_cookies = dict(client.cookies)
+
+    # Grouped cookie findings: cookie_key -> list of working (value, evidence, confidence)
+    cookie_hits: Dict[str, list] = {}
+
     async def _test_cookie_role(c_key, c_val):
         async with semaphore:
             try:
@@ -428,40 +471,65 @@ async def test_privilege_escalation(
                     cookies={**original_cookies, c_key: c_val},
                     timeout=timeout,
                 )
-                if resp.status_code == 200:
-                    sensitive, evidence = is_sensitive_response(200, 403, resp.text)
-                    if sensitive:
-                        findings.append(BACFinding(
-                            check_type=BACType.PRIVILEGE_ESCALATION,
-                            bypass_technique=BypassTechnique.COOKIE_TAMPER,
-                            target_url=url,
-                            method="GET",
-                            parameter=f"Cookie: {c_key}",
-                            original_value="user",
-                            tampered_value=c_val,
-                            evidence=evidence,
-                            severity=SeverityLevel.CRITICAL,
-                            description=(
-                                f"Setting cookie '{c_key}={c_val}' granted elevated access. "
-                                f"The application trusts client-controlled cookie values for authorization."
-                            ),
-                            remediation=(
-                                "Never use client-readable/writable cookies for authorization decisions. "
-                                "Use signed, server-verified session tokens (e.g. HttpOnly, Secure cookies). "
-                                "Implement server-side session storage for role/permission data."
-                            ),
-                        ))
-                        return True
+                # Use the REAL baseline status (not hardcoded 403)
+                found, evidence, confidence = is_sensitive_response(
+                    resp.status_code, baseline_status, resp.text
+                )
+                # Secondary check: same status but body differs significantly + has sensitive content
+                if not found and resp.status_code == 200:
+                    sensitive, kw_evidence = has_sensitive_content(resp.text)
+                    if sensitive and significant_body_diff(resp.text, baseline_body):
+                        found = True
+                        evidence = kw_evidence + " (body significantly changed after cookie injection)"
+                        confidence = ConfidenceLevel.MEDIUM
+
+                if found:
+                    if c_key not in cookie_hits:
+                        cookie_hits[c_key] = []
+                    cookie_hits[c_key].append((c_val, evidence, confidence))
             except Exception as e:
                 errors.append(f"Cookie tamper test error: {str(e)}")
-            return False
 
     cookie_tasks = []
     for cookie_key in COOKIE_ROLE_KEYS:
         for cookie_val in COOKIE_ELEVATED_VALUES[:3]:
             cookie_tasks.append(_test_cookie_role(cookie_key, cookie_val))
-    
+
     await asyncio.gather(*cookie_tasks)
+
+    # Emit one grouped finding per vulnerable cookie key
+    for c_key, hits in cookie_hits.items():
+        payloads = [h[0] for h in hits]
+        best_confidence = hits[0][2]  # first hit is usually the strongest
+        first_evidence = hits[0][1]
+        # Severity: CRITICAL only if HIGH confidence, else HIGH
+        severity = SeverityLevel.CRITICAL if best_confidence == ConfidenceLevel.HIGH else SeverityLevel.HIGH
+        findings.append(BACFinding(
+            check_type=BACType.PRIVILEGE_ESCALATION,
+            bypass_technique=BypassTechnique.COOKIE_TAMPER,
+            target_url=url,
+            method="GET",
+            parameter=f"Cookie: {c_key}",
+            original_value="user",
+            tampered_value=payloads[0],
+            payloads_tested=payloads,
+            evidence=(
+                f"{first_evidence} — {len(payloads)} payload(s) confirmed: "
+                + ", ".join(f"{c_key}={v}" for v in payloads)
+            ),
+            severity=severity,
+            confidence=best_confidence,
+            description=(
+                f"Setting the '{c_key}' cookie to elevated values granted privileged access. "
+                f"{len(payloads)} payload(s) confirmed: {', '.join(payloads)}. "
+                f"The application trusts client-controlled cookie values for authorization."
+            ),
+            remediation=(
+                "Never use client-readable/writable cookies for authorization decisions. "
+                "Use signed, server-verified session tokens (e.g. HttpOnly, Secure cookies). "
+                "Implement server-side session storage for role/permission data."
+            ),
+        ))
 
 
 # ──────────────────────────────────────────────

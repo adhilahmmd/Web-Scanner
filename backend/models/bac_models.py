@@ -10,6 +10,12 @@ class SeverityLevel(str, Enum):
     CRITICAL = "critical"
 
 
+class ConfidenceLevel(str, Enum):
+    HIGH = "high"      # Strong evidence: status change + sensitive content confirmed
+    MEDIUM = "medium"  # Moderate evidence: status change OR significant body difference
+    LOW = "low"        # Weak evidence: minor response difference, possible false positive
+
+
 class BACType(str, Enum):
     IDOR = "IDOR"
     FORCED_BROWSING = "Forced Browsing"
@@ -50,8 +56,10 @@ class BACFinding(BaseModel):
     parameter: Optional[str] = None
     original_value: Optional[str] = None
     tampered_value: Optional[str] = None
+    payloads_tested: Optional[List[str]] = Field(default_factory=list)
     evidence: str
     severity: SeverityLevel
+    confidence: ConfidenceLevel = ConfidenceLevel.MEDIUM
     description: str
     remediation: str
 

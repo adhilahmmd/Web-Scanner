@@ -25,6 +25,12 @@ const SEV_COLORS = {
   info:     '#636e7b',
 };
 
+const CONF_COLORS = {
+  high:   '#34c759',
+  medium: '#ffd60a',
+  low:    '#636e7b',
+};
+
 /* ══════════════════════════════════════════════
    App State
    ══════════════════════════════════════════════ */
@@ -424,13 +430,18 @@ function renderFindingsTable(findings, severityFilter = '', moduleFilter = '') {
 
   tbody.innerHTML = filtered.map((f, i) => {
     const sev = (f.severity || 'info').toLowerCase();
+    const conf = (f.confidence || '').toLowerCase();
     const mod = f._module || '';
     const desc = f.description || f.evidence || '—';
     const param = f.parameter || f.header_name || f.check_type || '—';
 
+    const confBadge = conf
+      ? `<span class="conf-badge" style="background:${CONF_COLORS[conf] || '#636e7b'}22;color:${CONF_COLORS[conf] || '#636e7b'};border:1px solid ${CONF_COLORS[conf] || '#636e7b'}44;border-radius:4px;font-size:0.65rem;padding:1px 5px;margin-left:4px;vertical-align:middle">${conf.toUpperCase()}</span>`
+      : '';
+
     return `
       <tr data-idx="${i}">
-        <td><span class="sev-badge sev-badge-${sev}">${sev}</span></td>
+        <td><span class="sev-badge sev-badge-${sev}">${sev.toUpperCase()}</span>${confBadge}</td>
         <td><span class="module-badge">${MODULE_NAMES[mod] || mod}</span></td>
         <td class="cell-desc">${escapeHtml(desc.substring(0, 120))}${desc.length > 120 ? '...' : ''}</td>
         <td class="cell-param" title="${escapeHtml(param)}">${escapeHtml(param)}</td>
@@ -462,17 +473,26 @@ function openFindingModal(finding) {
   if (!modal || !finding) return;
 
   const sev = (finding.severity || 'info').toLowerCase();
+  const conf = (finding.confidence || '').toLowerCase();
   title.textContent = finding.description || finding.check_type || 'Finding Detail';
 
+  const confColor = CONF_COLORS[conf] || '#636e7b';
+  const confBadgeHtml = conf
+    ? `<span style="background:${confColor}22;color:${confColor};border:1px solid ${confColor}44;border-radius:4px;padding:2px 8px;font-size:0.75rem;font-weight:600">${conf.toUpperCase()} CONFIDENCE</span>`
+    : '';
+
   const rows = [
-    { label: 'Severity', value: `<span class="sev-badge sev-badge-${sev}">${sev}</span>` },
+    { label: 'Severity', value: `<span class="sev-badge sev-badge-${sev}">${sev.toUpperCase()}</span>` },
+    conf ? { label: 'Confidence', value: confBadgeHtml, raw: true } : null,
     { label: 'Module', value: `<span class="module-badge">${MODULE_NAMES[finding._module] || finding._module || '—'}</span>` },
     finding.parameter ? { label: 'Parameter / Field', value: `<div class="detail-value monospace">${escapeHtml(finding.parameter)}</div>`, raw: true } : null,
     finding.header_name ? { label: 'Header', value: `<div class="detail-value monospace">${escapeHtml(finding.header_name)}</div>`, raw: true } : null,
     finding.check_type ? { label: 'Check Type', value: finding.check_type } : null,
     finding.xss_type ? { label: 'XSS Type', value: finding.xss_type } : null,
     finding.injection_point ? { label: 'Injection Point', value: finding.injection_point } : null,
-    finding.payload ? { label: 'Payload Used', value: `<div class="detail-value monospace">${escapeHtml(finding.payload)}</div>`, raw: true } : null,
+    (finding.payloads_tested && finding.payloads_tested.length > 0)
+      ? { label: `Payloads Tested (${finding.payloads_tested.length})`, value: `<div class="detail-value monospace">${escapeHtml(finding.payloads_tested.join(', '))}</div>`, raw: true }
+      : finding.payload ? { label: 'Payload Used', value: `<div class="detail-value monospace">${escapeHtml(finding.payload)}</div>`, raw: true } : null,
     finding.evidence ? { label: 'Evidence', value: `<div class="detail-value monospace">${escapeHtml(finding.evidence.substring(0, 500))}</div>`, raw: true } : null,
     finding.description ? { label: 'Description', value: finding.description } : null,
     finding.remediation ? { label: 'Remediation', value: `<div class="detail-value remediation">${escapeHtml(finding.remediation)}</div>`, raw: true } : null,
