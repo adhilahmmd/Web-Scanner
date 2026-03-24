@@ -377,6 +377,14 @@ async def unified_scan_async(
                 "error": "Global scan timeout reached (10 minutes). Target may be too large or slow.",
                 "url": request.url,
             }
+        except asyncio.CancelledError:
+            unified_jobs[job_id].update({
+                "status": "cancelled",
+                "progress": 0,
+                "result": None,
+            })
+            if "error" not in unified_jobs[job_id]:
+                unified_jobs[job_id]["error"] = "Scan manually stopped by user."
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -388,7 +396,9 @@ async def unified_scan_async(
                 "url": request.url,
             }
 
-    background_tasks.add_task(_run)
+    task = asyncio.create_task(_run())
+    unified_jobs[job_id]["task"] = task
+    
     return {
         "job_id": job_id,
         "status": "running",
@@ -396,6 +406,26 @@ async def unified_scan_async(
         "poll_url": f"/api/scan/{job_id}"
     }
 
+
+# ──────────────────────────────────────────────
+# POST /api/scan/{job_id}/stop  — stop job
+# ──────────────────────────────────────────────
+@router.post("/{job_id}/stop", summary="Stop a running unified scan")
+async def stop_unified_scan(job_id: str):
+    """Manually stop a running async scan job."""
+    job = unified_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    
+    if job["status"] == "running":
+        job["status"] = "cancelled"
+        job["error"] = "Scan manually stopped by user."
+        task = job.get("task")
+        if task and not task.done():
+            task.cancel()
+        return {"job_id": job_id, "status": "cancelled", "message": "Scan stopped successfully"}
+    
+    return {"job_id": job_id, "status": job["status"], "message": "Scan is already finished or not running"}
 
 # ──────────────────────────────────────────────
 # GET /api/scan/modules/list  — list available modules

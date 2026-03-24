@@ -40,6 +40,7 @@ const state = {
   allFindings: [],
   scanning: false,
   wizardStep: 1,  // 1 = Target+Crawler, 2 = Modules+Scope, 3 = Active Scan
+  currentJobId: null,
 };
 
 /* ══════════════════════════════════════════════
@@ -206,7 +207,8 @@ async function launchScan() {
   try {
     const pollResult = await window.api.runModules(
       url, modules, timeout, crawlerConfig,
-      (pct) => setProgress(pct)
+      (pct) => setProgress(pct),
+      (jobId) => { state.currentJobId = jobId; }
     );
 
     setProgress(100);
@@ -257,7 +259,15 @@ async function launchScan() {
 
     setTimeout(() => {
       state.scanning = false;
+      state.currentJobId = null;
       updateScanButton(false);
+      
+      const stopBtn = $('#stop-scan-btn');
+      if (stopBtn) {
+        stopBtn.disabled = false;
+        stopBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg> Stop Scan`;
+      }
+
       renderResults(result);
       navigate('results');
       if (window.auth?.isLoggedIn()) {
@@ -271,9 +281,17 @@ async function launchScan() {
 
   } catch (err) {
     state.scanning = false;
+    state.currentJobId = null;
     updateScanButton(false);
+    
+    const stopBtn = $('#stop-scan-btn');
+    if (stopBtn) {
+      stopBtn.disabled = false;
+      stopBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg> Stop Scan`;
+    }
+
     addLog(`[ ✗ ] Error: ${err.message}`, 'error');
-    toast(`Scan failed: ${err.message}`, 'error');
+    toast(`Scan stopped: ${err.message}`, 'error');
     // Allow going back to config
     setTimeout(() => goToStep(2), 1500);
   }
@@ -729,6 +747,24 @@ function init() {
   // Step 3 → Step 2 (Back — only allowed when not scanning)
   $('#wizard-back-3')?.addEventListener('click', () => {
     if (!state.scanning) goToStep(2);
+  });
+
+  // Stop Scan button (on step 3)
+  $('#stop-scan-btn')?.addEventListener('click', async () => {
+    if (!state.scanning || !state.currentJobId) return;
+    
+    const btn = $('#stop-scan-btn');
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner" style="border-width:2px;width:14px;height:14px;border-color:#ff2d55;border-right-color:transparent;margin-right:6px;display:inline-block;vertical-align:middle;"></span> Stopping...`;
+    
+    try {
+      await window.api.stopScan(state.currentJobId);
+      addLog(`[ ! ] Stop signal sent. Halting modules...`, 'warn');
+    } catch (err) {
+      toast('Failed to stop: ' + err.message, 'error');
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg> Stop Scan`;
+    }
   });
 
   // Launch Scan button (on step 2)

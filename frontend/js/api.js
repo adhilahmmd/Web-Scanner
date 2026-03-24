@@ -53,6 +53,11 @@ class API {
     return this._fetch('GET', `/api/scan/${jobId}`);
   }
 
+  // ── Stop Scan ────────────────────────────────
+  async stopScan(jobId) {
+    return this._fetch('POST', `/api/scan/${jobId}/stop`);
+  }
+
   // ── Poll helper ──────────────────────────────
   /**
    * Poll a job endpoint until completion.
@@ -86,6 +91,9 @@ class API {
             clearInterval(interval);
             onProgress(100);
             resolve(data.result);
+          } else if (data.status === 'cancelled') {
+            clearInterval(interval);
+            reject(new Error(data.error || 'Scan was manually stopped.'));
           } else if (data.status === 'failed') {
             clearInterval(interval);
             reject(new Error(data.error || 'Scan failed.'));
@@ -107,12 +115,13 @@ class API {
    * @param {Function} onProgress - Called with progress percentage 0-100
    * @returns {object} Map of moduleName -> moduleResult
    */
-  async runModules(url, modules, timeout, crawlerConfig = {}, onProgress = () => {}) {
+  async runModules(url, modules, timeout, crawlerConfig = {}, onProgress = () => {}, onJobCreated = null) {
     onProgress(10);
 
     // 1. Kick off unified scan
     const job = await this.unifiedScanAsync(url, modules, timeout, crawlerConfig);
     const jobId = job.job_id;
+    if (onJobCreated) onJobCreated(jobId);
 
     onProgress(25);
 
