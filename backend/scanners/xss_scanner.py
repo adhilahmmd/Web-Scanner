@@ -11,6 +11,8 @@ import httpx
 import asyncio
 import re
 import json
+import random
+import string
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from bs4 import BeautifulSoup
 from typing import List, Dict, Tuple, Optional
@@ -119,17 +121,52 @@ def inject_url_param(url: str, param: str, payload: str) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
-def payload_reflected(payload: str, response_text: str) -> bool:
-    """Check if payload or its key identifiers appear in response."""
-    checks = [
-        payload.lower() in response_text.lower(),
-        "<script>" in response_text.lower() and "alert" in response_text.lower(),
-        "onerror=alert" in response_text.lower(),
-        "onload=alert" in response_text.lower(),
-        "onfocus=alert" in response_text.lower(),
-        "ontoggle=alert" in response_text.lower(),
+def generate_token(length: int = 8) -> str:
+    """Generate a unique random string for injection correlation."""
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def payload_reflected(payload: str, response_text: str, status_code: int = 200) -> bool:
+    """
+    Check if payload or its key identifiers appear in response safely.
+    Reduces false positives by:
+    1. Checking for HTML encoding.
+    2. Handling 4xx/5xx (e.g. WAF block pages) more conservatively.
+    3. Verifying the context of reflection.
+    """
+    lower_text = response_text.lower()
+    lower_payload = payload.lower()
+
+    # 1. Conservatively handle error pages (WAFs often echo blocked payloads)
+    if status_code >= 400:
+        # If it's an error page, only flag if it's a very direct reflection of a script tag
+        # that isn't clearly part of an error message.
+        if "<script>" in lower_text and "alert" in lower_text:
+            if "&lt;script&gt;" not in lower_text:
+                return True
+        return False
+
+    # 2. Check for the literal payload
+    if lower_payload in lower_text:
+        # If payload contains < or > but they are encoded in the response, it's safe
+        if "<" in payload and "&lt;" in lower_text:
+            return False
+        if ">" in payload and "&gt;" in lower_text:
+            return False
+        # If it's in a comment, it's generally low risk (though still worth noting, but maybe not HIGH)
+        # For now, if it's there unencoded, we flag it.
+        return True
+
+    # 3. Check for generic script identifiers if the exact payload isn't found
+    # (e.g. if the application modifies the payload slightly but still leaves it executable)
+    script_checks = [
+        "<script>" in lower_text and "alert" in lower_text and "&lt;script&gt;" not in lower_text,
+        "onerror=alert" in lower_text and "onerror=" in lower_text,
+        "onload=alert" in lower_text and "onload=" in lower_text,
+        "onfocus=alert" in lower_text and "onfocus=" in lower_text,
     ]
-    return any(checks)
+    
+    return any(script_checks)
 
 
 def detect_dom_sinks(html: str) -> List[str]:
@@ -202,22 +239,23 @@ async def test_reflected_url_params(
     if not params:
         return
 
-    for param in params:
-        for payload in REFLECTED_PAYLOADS:
-            payloads_tested.append(payload)
-            injected_url = inject_url_param(url, param, payload)
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_param_payload(p, py):
+        async with semaphore:
+            injected_url = inject_url_param(url, p, py)
             try:
                 resp = await client.get(injected_url, timeout=timeout)
-                if payload_reflected(payload, resp.text):
+                if payload_reflected(py, resp.text, resp.status_code):
                     findings.append(XSSFinding(
                         xss_type=XSSType.REFLECTED,
                         injection_point=InjectionPoint.URL_PARAM,
-                        parameter=param,
-                        payload=payload,
-                        evidence=f"Payload found unescaped in response body for parameter '{param}'",
+                        parameter=p,
+                        payload=py,
+                        evidence=f"Payload found unescaped in response body for parameter '{p}'",
                         severity=SeverityLevel.HIGH,
                         description=(
-                            f"URL parameter '{param}' is vulnerable to Reflected XSS. "
+                            f"URL parameter '{p}' is vulnerable to Reflected XSS. "
                             f"The application echoes user input back into the HTML without sanitization."
                         ),
                         remediation=(
@@ -226,11 +264,21 @@ async def test_reflected_url_params(
                             "Use a templating engine with auto-escaping enabled."
                         ),
                     ))
-                    break  # One finding per param is enough
+                    return True  # found
             except httpx.TimeoutException:
-                errors.append(f"Timeout on URL param '{param}'")
+                errors.append(f"Timeout on URL param '{p}'")
             except Exception as e:
-                errors.append(f"Error on URL param '{param}': {str(e)}")
+                errors.append(f"Error on URL param '{p}': {str(e)}")
+            return False
+
+    # Parallelize over parameters
+    for param in params:
+        # For each param, we can test a few payloads in parallel, but maybe just sequential payloads per param
+        # to stop early if one is found.
+        param_payload_tasks = [_test_param_payload(param, payload) for payload in REFLECTED_PAYLOADS]
+        # We use a trick to stop as soon as one finding is found for this param, but gather doesn't support that easily.
+        # So we just run them and the function returns early.
+        await asyncio.gather(*param_payload_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -259,31 +307,31 @@ async def test_forms_xss(
 
         injection_point = InjectionPoint.FORM_GET if method == "get" else InjectionPoint.FORM_POST
 
-        for field_name in base_inputs:
-            for payload in REFLECTED_PAYLOADS[:6]:  # limit payloads per field
-                payloads_tested.append(payload)
-                data = {**base_inputs, field_name: payload}
+        semaphore = asyncio.Semaphore(3)
 
+        async def _test_form_field_payload(f_name, py):
+            async with semaphore:
+                payloads_tested.append(py)
+                data = {**base_inputs, f_name: py}
                 try:
                     if method == "post":
                         resp = await client.post(action, data=data, timeout=timeout)
                     else:
                         resp = await client.get(action, params=data, timeout=timeout)
 
-                    # Check reflected XSS
-                    if payload_reflected(payload, resp.text):
+                    if payload_reflected(py, resp.text, resp.status_code):
                         findings.append(XSSFinding(
                             xss_type=XSSType.REFLECTED,
                             injection_point=injection_point,
-                            parameter=field_name,
-                            payload=payload,
+                            parameter=f_name,
+                            payload=py,
                             evidence=(
                                 f"Payload reflected in form response via {method.upper()} "
-                                f"to '{action}' for field '{field_name}'"
+                                f"to '{action}' for field '{f_name}'"
                             ),
                             severity=SeverityLevel.HIGH,
                             description=(
-                                f"Form field '{field_name}' at '{action}' is vulnerable to "
+                                f"Form field '{f_name}' at '{action}' is vulnerable to "
                                 f"Reflected XSS via {method.upper()} submission."
                             ),
                             remediation=(
@@ -292,12 +340,17 @@ async def test_forms_xss(
                                 "Implement strict CSP headers."
                             ),
                         ))
-                        break
-
-                except httpx.TimeoutException:
-                    errors.append(f"Timeout on form field '{field_name}'")
+                        return True
                 except Exception as e:
-                    errors.append(f"Error on form '{action}': {str(e)}")
+                    errors.append(f"Error on form '{action}' field '{f_name}': {str(e)}")
+                return False
+
+        field_payload_tasks = []
+        for field_name in base_inputs:
+            for payload in REFLECTED_PAYLOADS[:6]:
+                field_payload_tasks.append(_test_form_field_payload(field_name, payload))
+        
+        await asyncio.gather(*field_payload_tasks)
 
         # Stored XSS: submit payload then re-fetch page and check persistence
         for payload in STORED_XSS_MARKERS[:2]:
@@ -402,7 +455,7 @@ async def test_dom_xss(
                 test_url = url + payload
                 try:
                     dom_resp = await client.get(test_url, timeout=timeout)
-                    if payload_reflected(payload, dom_resp.text):
+                    if payload_reflected(payload, dom_resp.text, dom_resp.status_code):
                         findings.append(XSSFinding(
                             xss_type=XSSType.DOM,
                             injection_point=InjectionPoint.URL_PARAM,
@@ -448,25 +501,27 @@ async def test_header_xss(
         "Accept-Language": "en-US",
     }
 
-    for header_name in headers_to_test:
-        for payload in HEADER_PAYLOADS:
-            payloads_tested.append(payload)
-            custom_headers = {**headers_to_test, header_name: payload}
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_header_payload(h_name, py):
+        async with semaphore:
+            payloads_tested.append(py)
+            custom_headers = {**headers_to_test, h_name: py}
             try:
                 resp = await client.get(url, headers=custom_headers, timeout=timeout)
-                if payload_reflected(payload, resp.text):
+                if payload_reflected(py, resp.text, resp.status_code):
                     findings.append(XSSFinding(
                         xss_type=XSSType.REFLECTED,
                         injection_point=InjectionPoint.HEADER,
-                        parameter=header_name,
-                        payload=payload,
+                        parameter=h_name,
+                        payload=py,
                         evidence=(
-                            f"XSS payload injected via HTTP header '{header_name}' "
+                            f"XSS payload injected via HTTP header '{h_name}' "
                             f"was reflected in the response body."
                         ),
                         severity=SeverityLevel.HIGH,
                         description=(
-                            f"The application reflects the value of the '{header_name}' "
+                            f"The application reflects the value of the '{h_name}' "
                             f"HTTP header into the HTML response without sanitization."
                         ),
                         remediation=(
@@ -475,11 +530,17 @@ async def test_header_xss(
                             "Implement CSP headers to mitigate XSS impact."
                         ),
                     ))
-                    break
-            except httpx.TimeoutException:
-                errors.append(f"Timeout on header XSS test for '{header_name}'")
+                    return True
             except Exception as e:
-                errors.append(f"Header XSS error for '{header_name}': {str(e)}")
+                errors.append(f"Header XSS error for '{h_name}': {str(e)}")
+            return False
+
+    header_tasks = []
+    for header_name in headers_to_test:
+        for payload in HEADER_PAYLOADS:
+            header_tasks.append(_test_header_payload(header_name, payload))
+    
+    await asyncio.gather(*header_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -503,10 +564,12 @@ async def test_json_xss(
         "Accept": "application/json",
     }
 
-    for param in params:
-        for payload in JSON_PAYLOADS[:4]:
-            payloads_tested.append(payload)
-            json_body = {param: payload}
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_json_field_payload(p, py):
+        async with semaphore:
+            payloads_tested.append(py)
+            json_body = {p: py}
             try:
                 resp = await client.post(
                     url,
@@ -516,20 +579,19 @@ async def test_json_xss(
                 )
                 content_type = resp.headers.get("content-type", "")
 
-                # If JSON response reflects our payload unescaped
-                if payload in resp.text and "application/json" not in content_type:
+                if py in resp.text and "application/json" not in content_type:
                     findings.append(XSSFinding(
                         xss_type=XSSType.REFLECTED,
                         injection_point=InjectionPoint.JSON,
-                        parameter=param,
-                        payload=payload,
+                        parameter=p,
+                        payload=py,
                         evidence=(
-                            f"XSS payload in JSON body for key '{param}' was reflected "
+                            f"XSS payload in JSON body for key '{p}' was reflected "
                             f"in a non-JSON response (content-type: {content_type})"
                         ),
-                        severity=SeverityLevel.MEDIUM,
+                        severity=SeverityLevel.HIGH,
                         description=(
-                            f"The endpoint accepted a JSON payload with XSS in field '{param}' "
+                            f"The endpoint accepted a JSON payload with XSS in field '{p}' "
                             f"and reflected it back in an HTML response — indicating improper "
                             f"output encoding for JSON-sourced data."
                         ),
@@ -539,11 +601,17 @@ async def test_json_xss(
                             "Use JSON.stringify() safely and avoid injecting JSON directly into HTML."
                         ),
                     ))
-                    break
-            except httpx.TimeoutException:
-                errors.append(f"Timeout on JSON XSS test for '{param}'")
+                    return True
             except Exception as e:
-                errors.append(f"JSON XSS error for '{param}': {str(e)}")
+                errors.append(f"JSON XSS error for '{p}': {str(e)}")
+            return False
+
+    json_field_tasks = []
+    for param in params:
+        for payload in JSON_PAYLOADS[:4]:
+            json_field_tasks.append(_test_json_field_payload(param, payload))
+    
+    await asyncio.gather(*json_field_tasks)
 
 
 # ──────────────────────────────────────────────

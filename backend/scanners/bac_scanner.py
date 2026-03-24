@@ -121,7 +121,7 @@ def get_base_url(url: str) -> str:
 
 def is_sensitive_response(status: int, original_status: int, body: str) -> Tuple[bool, str]:
     """Determine if a response indicates unauthorized access."""
-    # Redirected to login page
+    # Only signal status-change bypass when we actually verified original was blocked
     if original_status in (401, 403) and status == 200:
         return True, f"Status changed from {original_status} → 200 (bypass successful)"
 
@@ -136,6 +136,21 @@ def is_sensitive_response(status: int, original_status: int, body: str) -> Tuple
         if kw in lower_body and status == 200:
             return True, f"Sensitive keyword '{kw}' found in accessible response"
 
+    return False, ""
+
+
+def has_sensitive_content(body: str) -> Tuple[bool, str]:
+    """Check if a response body contains sensitive keywords (no status-change assumption)."""
+    sensitive_keywords = [
+        "admin", "dashboard", "control panel", "manage users",
+        "system settings", "user list", "delete user",
+        "config", "secret", "private", "internal",
+        "password", "credential", "token", "api_key",
+    ]
+    lower_body = body.lower()
+    for kw in sensitive_keywords:
+        if kw in lower_body:
+            return True, f"Sensitive keyword '{kw}' found in accessible response"
     return False, ""
 
 
@@ -181,43 +196,37 @@ async def test_idor(
         errors.append(f"IDOR baseline failed: {str(e)}")
         return
 
-    for param, value in id_params.items():
-        # Try adjacent IDs
-        try:
-            original_id = int(value)
-            test_ids = [original_id - 1, original_id + 1, original_id + 100, 0, 999]
-        except ValueError:
-            test_ids = [1, 2, 3, 999]
+    semaphore = asyncio.Semaphore(5)
 
-        for test_id in test_ids:
-            checks.append(f"IDOR:{param}={test_id}")
-            tampered_url = inject_param(url, param, str(test_id))
+    async def _test_idor_id(p, v, t_id):
+        async with semaphore:
+            checks.append(f"IDOR:{p}={t_id}")
+            tampered_url = inject_param(url, p, str(t_id))
             try:
                 resp = await client.get(tampered_url, timeout=timeout)
                 diff = abs(len(resp.text) - baseline_len)
 
-                # Different content returned = possible IDOR
                 if (resp.status_code == 200
                         and diff > 100
                         and resp.status_code == baseline_status
-                        and str(test_id) != str(value)):
+                        and str(t_id) != str(v)):
                     findings.append(BACFinding(
                         check_type=BACType.IDOR,
                         bypass_technique=BypassTechnique.PARAM_TAMPER,
                         target_url=tampered_url,
                         method="GET",
-                        parameter=param,
-                        original_value=str(value),
-                        tampered_value=str(test_id),
+                        parameter=p,
+                        original_value=str(v),
+                        tampered_value=str(t_id),
                         evidence=(
-                            f"Parameter '{param}' changed from '{value}' → '{test_id}' "
+                            f"Parameter '{p}' changed from '{v}' → '{t_id}' "
                             f"returned HTTP 200 with different content "
                             f"(size diff: {diff} bytes)"
                         ),
                         severity=SeverityLevel.HIGH,
                         description=(
-                            f"The parameter '{param}' appears to directly reference an internal "
-                            f"object (ID={test_id}) and returns different data without access control. "
+                            f"The parameter '{p}' appears to directly reference an internal "
+                            f"object (ID={t_id}) and returns different data without access control. "
                             f"An attacker could enumerate other users' data by changing this ID."
                         ),
                         remediation=(
@@ -226,9 +235,23 @@ async def test_idor(
                             "Verify the requesting user owns the requested resource before returning data."
                         ),
                     ))
-                    break
+                    return True
             except Exception as e:
-                errors.append(f"IDOR test error on {param}={test_id}: {str(e)}")
+                errors.append(f"IDOR test error on {p}={t_id}: {str(e)}")
+            return False
+
+    tasks = []
+    for param, value in id_params.items():
+        try:
+            original_id = int(value)
+            test_ids = [original_id - 1, original_id + 1, original_id + 100, 0, 999]
+        except ValueError:
+            test_ids = [1, 2, 3, 999]
+        
+        for t_id in test_ids:
+            tasks.append(_test_idor_id(param, value, t_id))
+    
+    await asyncio.gather(*tasks)
 
 
 # ──────────────────────────────────────────────
@@ -245,50 +268,47 @@ async def test_forced_browsing(
 ):
     base_url = get_base_url(url)
 
-    # Get baseline for a known-restricted path
-    for restricted_path in RESTRICTED_PATHS[:30]:
-        target = base_url + restricted_path
-        checks.append(f"FORCED:{target}")
+    semaphore = asyncio.Semaphore(10)
 
-        try:
-            resp = await client.get(target, timeout=timeout)
+    async def _test_path(restricted_path):
+        async with semaphore:
+            target = base_url + restricted_path
+            checks.append(f"FORCED:{target}")
+            try:
+                resp = await client.get(target, timeout=timeout)
+                if resp.status_code == 200 and len(resp.text) > 200:
+                    sensitive, evidence = has_sensitive_content(resp.text)
+                    findings.append(BACFinding(
+                        check_type=BACType.FORCED_BROWSING,
+                        bypass_technique=BypassTechnique.URL_MANIPULATION,
+                        target_url=target,
+                        method="GET",
+                        evidence=(
+                            evidence or
+                            f"Restricted path '{restricted_path}' returned HTTP 200 "
+                            f"({len(resp.text)} bytes) without authentication"
+                        ),
+                        severity=SeverityLevel.HIGH,
+                        description=(
+                            f"The path '{restricted_path}' is accessible without authentication. "
+                            f"This may expose administrative functionality or sensitive data."
+                        ),
+                        remediation=(
+                            "Implement proper authentication and authorization on all restricted endpoints. "
+                            "Use a centralized access control middleware. "
+                            "Return 401/403 for unauthenticated/unauthorized access — never 200."
+                        ),
+                    ))
+                elif resp.status_code == 403:
+                    await test_path_bypass(
+                        client, base_url, restricted_path,
+                        timeout, findings, errors, checks
+                    )
+            except Exception as e:
+                errors.append(f"Forced browse error {target}: {str(e)}")
 
-            # Flag if admin/restricted path returns 200
-            if resp.status_code == 200 and len(resp.text) > 200:
-                sensitive, evidence = is_sensitive_response(200, 403, resp.text)
-                findings.append(BACFinding(
-                    check_type=BACType.FORCED_BROWSING,
-                    bypass_technique=BypassTechnique.URL_MANIPULATION,
-                    target_url=target,
-                    method="GET",
-                    evidence=(
-                        evidence or
-                        f"Restricted path '{restricted_path}' returned HTTP 200 "
-                        f"({len(resp.text)} bytes) without authentication"
-                    ),
-                    severity=SeverityLevel.HIGH,
-                    description=(
-                        f"The path '{restricted_path}' is accessible without authentication. "
-                        f"This may expose administrative functionality or sensitive data."
-                    ),
-                    remediation=(
-                        "Implement proper authentication and authorization on all restricted endpoints. "
-                        "Use a centralized access control middleware. "
-                        "Return 401/403 for unauthenticated/unauthorized access — never 200."
-                    ),
-                ))
-
-            # Try path bypass tricks on 403 responses
-            elif resp.status_code == 403:
-                await test_path_bypass(
-                    client, base_url, restricted_path,
-                    timeout, findings, errors, checks
-                )
-
-        except httpx.TimeoutException:
-            errors.append(f"Timeout on forced browse: {target}")
-        except Exception as e:
-            errors.append(f"Forced browse error {target}: {str(e)}")
+    tasks = [_test_path(rp) for rp in RESTRICTED_PATHS[:30]]
+    await asyncio.gather(*tasks)
 
 
 async def test_path_bypass(
@@ -301,38 +321,45 @@ async def test_path_bypass(
     checks: List[str],
 ):
     """Try URL manipulation tricks to bypass a 403 response."""
-    for trick in PATH_BYPASS_TRICKS:
-        bypass_path = trick.replace("{path}", path.lstrip("/"))
-        bypass_url = base_url + "/" + bypass_path
-        checks.append(f"BYPASS:{bypass_url}")
-        try:
-            resp = await client.get(bypass_url, timeout=timeout)
-            if resp.status_code == 200 and len(resp.text) > 200:
-                findings.append(BACFinding(
-                    check_type=BACType.FORCED_BROWSING,
-                    bypass_technique=BypassTechnique.URL_MANIPULATION,
-                    target_url=bypass_url,
-                    method="GET",
-                    original_value=f"{path} → 403",
-                    tampered_value=bypass_path,
-                    evidence=(
-                        f"URL manipulation trick '{trick}' bypassed 403 on '{path}' "
-                        f"and returned HTTP 200 ({len(resp.text)} bytes)"
-                    ),
-                    severity=SeverityLevel.CRITICAL,
-                    description=(
-                        f"A URL manipulation trick bypassed access control on '{path}'. "
-                        f"The server returned 403 for the direct path but 200 for the manipulated version."
-                    ),
-                    remediation=(
-                        "Normalize all URL paths server-side before applying access control. "
-                        "Do not rely on path-matching alone — verify session permissions at the handler level. "
-                        "Use a WAF to block path traversal patterns."
-                    ),
-                ))
-                return
-        except Exception:
-            pass
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_trick(trick):
+        async with semaphore:
+            bypass_path = trick.replace("{path}", path.lstrip("/"))
+            bypass_url = base_url + "/" + bypass_path
+            checks.append(f"BYPASS:{bypass_url}")
+            try:
+                resp = await client.get(bypass_url, timeout=timeout)
+                if resp.status_code == 200 and len(resp.text) > 200:
+                    findings.append(BACFinding(
+                        check_type=BACType.FORCED_BROWSING,
+                        bypass_technique=BypassTechnique.URL_MANIPULATION,
+                        target_url=bypass_url,
+                        method="GET",
+                        original_value=f"{path} → 403",
+                        tampered_value=bypass_path,
+                        evidence=(
+                            f"URL manipulation trick '{trick}' bypassed 403 on '{path}' "
+                            f"and returned HTTP 200 ({len(resp.text)} bytes)"
+                        ),
+                        severity=SeverityLevel.CRITICAL,
+                        description=(
+                            f"A URL manipulation trick bypassed access control on '{path}'. "
+                            f"The server returned 403 for the direct path but 200 for the manipulated version."
+                        ),
+                        remediation=(
+                            "Normalize all URL paths server-side before applying access control. "
+                            "Do not rely on path-matching alone — verify session permissions at the handler level. "
+                            "Use a WAF to block path traversal patterns."
+                        ),
+                    ))
+                    return True
+            except Exception:
+                pass
+            return False
+
+    tasks = [_test_trick(t) for t in PATH_BYPASS_TRICKS]
+    await asyncio.gather(*tasks)
 
 
 # ──────────────────────────────────────────────
@@ -349,29 +376,28 @@ async def test_privilege_escalation(
 ):
     params = extract_params(url)
 
-    # Test role-related URL parameters
-    for role_param in ROLE_PARAMS:
-        for role_value in ROLE_VALUES[:4]:
-            checks.append(f"PRIV:{role_param}={role_value}")
-            # Inject role param even if not in original URL
-            tampered_url = inject_param(url, role_param, role_value)
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_role_param(rp, rv):
+        async with semaphore:
+            tampered_url = inject_param(url, rp, rv)
             try:
                 resp = await client.get(tampered_url, timeout=timeout)
                 if resp.status_code == 200:
-                    sensitive, evidence = is_sensitive_response(200, 403, resp.text)
+                    sensitive, evidence = has_sensitive_content(resp.text)
                     if sensitive:
                         findings.append(BACFinding(
                             check_type=BACType.PRIVILEGE_ESCALATION,
                             bypass_technique=BypassTechnique.PARAM_TAMPER,
                             target_url=tampered_url,
                             method="GET",
-                            parameter=role_param,
+                            parameter=rp,
                             original_value="user",
-                            tampered_value=role_value,
+                            tampered_value=rv,
                             evidence=evidence,
                             severity=SeverityLevel.CRITICAL,
                             description=(
-                                f"Adding/modifying the '{role_param}={role_value}' URL parameter "
+                                f"Adding/modifying the '{rp}={rv}' URL parameter "
                                 f"granted elevated access. The server trusts client-supplied role values."
                             ),
                             remediation=(
@@ -380,19 +406,26 @@ async def test_privilege_escalation(
                                 "Implement Role-Based Access Control (RBAC) at the server layer."
                             ),
                         ))
-                        return
+                        return True
             except Exception as e:
                 errors.append(f"Privilege escalation test error: {str(e)}")
+            return False
+
+    role_param_tasks = []
+    for role_param in ROLE_PARAMS:
+        for role_value in ROLE_VALUES[:4]:
+            role_param_tasks.append(_test_role_param(role_param, role_value))
+    
+    await asyncio.gather(*role_param_tasks)
 
     # Test cookie/token role manipulation
     original_cookies = dict(client.cookies)
-    for cookie_key in COOKIE_ROLE_KEYS:
-        for cookie_val in COOKIE_ELEVATED_VALUES[:3]:
-            checks.append(f"COOKIE:{cookie_key}={cookie_val}")
+    async def _test_cookie_role(c_key, c_val):
+        async with semaphore:
             try:
                 resp = await client.get(
                     url,
-                    cookies={**original_cookies, cookie_key: cookie_val},
+                    cookies={**original_cookies, c_key: c_val},
                     timeout=timeout,
                 )
                 if resp.status_code == 200:
@@ -403,13 +436,13 @@ async def test_privilege_escalation(
                             bypass_technique=BypassTechnique.COOKIE_TAMPER,
                             target_url=url,
                             method="GET",
-                            parameter=f"Cookie: {cookie_key}",
+                            parameter=f"Cookie: {c_key}",
                             original_value="user",
-                            tampered_value=cookie_val,
+                            tampered_value=c_val,
                             evidence=evidence,
                             severity=SeverityLevel.CRITICAL,
                             description=(
-                                f"Setting cookie '{cookie_key}={cookie_val}' granted elevated access. "
+                                f"Setting cookie '{c_key}={c_val}' granted elevated access. "
                                 f"The application trusts client-controlled cookie values for authorization."
                             ),
                             remediation=(
@@ -418,9 +451,17 @@ async def test_privilege_escalation(
                                 "Implement server-side session storage for role/permission data."
                             ),
                         ))
-                        return
+                        return True
             except Exception as e:
                 errors.append(f"Cookie tamper test error: {str(e)}")
+            return False
+
+    cookie_tasks = []
+    for cookie_key in COOKIE_ROLE_KEYS:
+        for cookie_val in COOKIE_ELEVATED_VALUES[:3]:
+            cookie_tasks.append(_test_cookie_role(cookie_key, cookie_val))
+    
+    await asyncio.gather(*cookie_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -448,46 +489,49 @@ async def test_missing_auth(
         "/admin/api/users", "/admin/api/config",
     ]
 
-    for path in auth_required_paths:
-        target = base_url + path
-        checks.append(f"AUTH:{target}")
-        try:
-            # Make request with NO auth cookies/headers
-            resp = await client.get(
-                target,
-                cookies={},
-                headers={"Authorization": ""},
-                timeout=timeout,
-            )
-            if resp.status_code == 200 and len(resp.text) > 100:
-                # Check if response looks like real data (JSON or HTML with content)
-                content_type = resp.headers.get("content-type", "")
-                is_data = "application/json" in content_type or len(resp.text) > 500
-                if is_data:
-                    findings.append(BACFinding(
-                        check_type=BACType.MISSING_AUTH,
-                        bypass_technique=BypassTechnique.URL_MANIPULATION,
-                        target_url=target,
-                        method="GET",
-                        evidence=(
-                            f"'{path}' returned HTTP 200 with {len(resp.text)} bytes "
-                            f"of content without any authentication credentials"
-                        ),
-                        severity=SeverityLevel.CRITICAL,
-                        description=(
-                            f"The endpoint '{path}' appears to be accessible without authentication. "
-                            f"Sensitive API endpoints should always require valid credentials."
-                        ),
-                        remediation=(
-                            "Implement authentication middleware on all sensitive endpoints. "
-                            "Return 401 Unauthorized when no valid credentials are provided. "
-                            "Use JWT or session-based auth and verify on every request."
-                        ),
-                    ))
-        except httpx.TimeoutException:
-            errors.append(f"Timeout on auth check: {target}")
-        except Exception:
-            pass
+    semaphore = asyncio.Semaphore(10)
+
+    async def _test_missing_auth(auth_path):
+        async with semaphore:
+            target = base_url + auth_path
+            checks.append(f"AUTH:{target}")
+            try:
+                # Make request with NO auth cookies/headers
+                resp = await client.get(
+                    target,
+                    cookies={},
+                    headers={"Authorization": ""},
+                    timeout=timeout,
+                )
+                if resp.status_code == 200 and len(resp.text) > 100:
+                    content_type = resp.headers.get("content-type", "")
+                    is_data = "application/json" in content_type or len(resp.text) > 500
+                    if is_data:
+                        findings.append(BACFinding(
+                            check_type=BACType.MISSING_AUTH,
+                            bypass_technique=BypassTechnique.URL_MANIPULATION,
+                            target_url=target,
+                            method="GET",
+                            evidence=(
+                                f"'{auth_path}' returned HTTP 200 with {len(resp.text)} bytes "
+                                f"of content without any authentication credentials"
+                            ),
+                            severity=SeverityLevel.CRITICAL,
+                            description=(
+                                f"The endpoint '{auth_path}' appears to be accessible without authentication. "
+                                f"Sensitive API endpoints should always require valid credentials."
+                            ),
+                            remediation=(
+                                "Implement authentication middleware on all sensitive endpoints. "
+                                "Return 401 Unauthorized when no valid credentials are provided. "
+                                "Use JWT or session-based auth and verify on every request."
+                            ),
+                        ))
+            except Exception:
+                pass
+
+    tasks = [_test_missing_auth(p) for p in auth_required_paths]
+    await asyncio.gather(*tasks)
 
 
 # ──────────────────────────────────────────────
@@ -510,43 +554,47 @@ async def test_method_tampering(
         errors.append(f"Method tamper baseline failed: {str(e)}")
         return
 
-    for method in ["POST", "PUT", "DELETE", "PATCH"]:
-        checks.append(f"METHOD:{method}:{url}")
-        try:
-            resp = await client.request(method, url, timeout=timeout)
+    semaphore = asyncio.Semaphore(5)
 
-            # Flag if a non-GET method gets 200 on a normally GET-only endpoint
-            if resp.status_code == 200 and method in ("DELETE", "PUT"):
-                findings.append(BACFinding(
-                    check_type=BACType.METHOD_TAMPERING,
-                    bypass_technique=BypassTechnique.URL_MANIPULATION,
-                    target_url=url,
-                    method=method,
-                    original_value="GET",
-                    tampered_value=method,
-                    evidence=(
-                        f"HTTP {method} on '{url}' returned 200 "
-                        f"— destructive method accepted without restriction"
-                    ),
-                    severity=SeverityLevel.HIGH,
-                    description=(
-                        f"The endpoint accepts HTTP {method} requests and returns 200. "
-                        f"Allowing {method} without proper authorization could enable "
-                        f"unauthorized data modification or deletion."
-                    ),
-                    remediation=(
-                        "Explicitly allowlist only the HTTP methods each endpoint should accept. "
-                        "Return 405 Method Not Allowed for unsupported methods. "
-                        "Apply the same authorization checks regardless of HTTP method."
-                    ),
-                ))
+    async def _test_method(m):
+        async with semaphore:
+            checks.append(f"METHOD:{m}:{url}")
+            try:
+                resp = await client.request(m, url, timeout=timeout)
+                if resp.status_code == 200 and m in ("DELETE", "PUT"):
+                    findings.append(BACFinding(
+                        check_type=BACType.METHOD_TAMPERING,
+                        bypass_technique=BypassTechnique.URL_MANIPULATION,
+                        target_url=url,
+                        method=m,
+                        original_value="GET",
+                        tampered_value=m,
+                        evidence=(
+                            f"HTTP {m} on '{url}' returned 200 "
+                            f"— destructive method accepted without restriction"
+                        ),
+                        severity=SeverityLevel.HIGH,
+                        description=(
+                            f"The endpoint accepts HTTP {m} requests and returns 200. "
+                            f"Allowing {m} without proper authorization could enable "
+                            f"unauthorized data modification or deletion."
+                        ),
+                        remediation=(
+                            "Explicitly allowlist only the HTTP methods each endpoint should accept. "
+                            "Return 405 Method Not Allowed for unsupported methods. "
+                            "Apply the same authorization checks regardless of HTTP method."
+                        ),
+                    ))
+            except Exception as e:
+                errors.append(f"Method tamper error {m}: {str(e)}")
 
-            # Method override via header (X-HTTP-Method-Override)
-            for override_method in ["DELETE", "PUT"]:
-                checks.append(f"METHOD_OVERRIDE:{override_method}")
+    async def _test_override(om):
+        async with semaphore:
+            checks.append(f"METHOD_OVERRIDE:{om}")
+            try:
                 override_resp = await client.post(
                     url,
-                    headers={"X-HTTP-Method-Override": override_method},
+                    headers={"X-HTTP-Method-Override": om},
                     timeout=timeout,
                 )
                 if override_resp.status_code == 200:
@@ -554,29 +602,30 @@ async def test_method_tampering(
                         check_type=BACType.METHOD_TAMPERING,
                         bypass_technique=BypassTechnique.HEADER_BYPASS,
                         target_url=url,
-                        method=f"POST + X-HTTP-Method-Override: {override_method}",
+                        method=f"POST + X-HTTP-Method-Override: {om}",
                         original_value="GET",
-                        tampered_value=f"X-HTTP-Method-Override: {override_method}",
+                        tampered_value=f"X-HTTP-Method-Override: {om}",
                         evidence=(
-                            f"X-HTTP-Method-Override: {override_method} returned 200 — "
+                            f"X-HTTP-Method-Override: {om} returned 200 — "
                             f"method override header is accepted by the server"
                         ),
                         severity=SeverityLevel.HIGH,
                         description=(
                             f"The server honours the X-HTTP-Method-Override header, "
-                            f"allowing a POST to act as {override_method}."
+                            f"allowing a POST to act as {om}."
                         ),
                         remediation=(
                             "Disable X-HTTP-Method-Override unless explicitly required. "
                             "If used, apply the same authorization checks as the real method."
                         ),
                     ))
-                    break
+            except Exception as e:
+                errors.append(f"Method override error {om}: {str(e)}")
 
-        except httpx.TimeoutException:
-            errors.append(f"Timeout on method tamper: {method} {url}")
-        except Exception as e:
-            errors.append(f"Method tamper error {method}: {str(e)}")
+    method_tasks = [_test_method(m) for m in ["POST", "PUT", "DELETE", "PATCH"]]
+    override_tasks = [_test_override(om) for om in ["DELETE", "PUT"]]
+    
+    await asyncio.gather(*(method_tasks + override_tasks))
 
 
 # ──────────────────────────────────────────────
@@ -598,16 +647,17 @@ async def test_header_bypass(
     # Test bypass headers against admin-like paths
     test_paths = ["/admin", "/dashboard", "/api/admin"]
 
-    for test_path in test_paths:
-        for header_template in BYPASS_HEADERS:
-            header = {
-                k: v.replace("{path}", test_path).replace("{base_url}", base_url)
-                for k, v in header_template.items()
-            }
-            header_name = list(header.keys())[0]
-            header_val = list(header.values())[0]
-            checks.append(f"HEADER:{header_name}:{header_val}")
+    semaphore = asyncio.Semaphore(5)
 
+    async def _test_header_path(tp, ht):
+        async with semaphore:
+            header = {
+                k: v.replace("{path}", tp).replace("{base_url}", base_url)
+                for k, v in ht.items()
+            }
+            h_name = list(header.keys())[0]
+            h_val = list(header.values())[0]
+            checks.append(f"HEADER:{h_name}:{h_val}")
             try:
                 resp = await client.get(
                     url,
@@ -615,23 +665,23 @@ async def test_header_bypass(
                     timeout=timeout,
                 )
                 if resp.status_code == 200 and len(resp.text) > 300:
-                    sensitive, evidence = is_sensitive_response(200, 403, resp.text)
+                    sensitive, evidence = has_sensitive_content(resp.text)
                     if sensitive:
                         findings.append(BACFinding(
                             check_type=BACType.FORCED_BROWSING,
                             bypass_technique=BypassTechnique.HEADER_BYPASS,
                             target_url=url,
                             method="GET",
-                            parameter=header_name,
+                            parameter=h_name,
                             original_value="(not set)",
-                            tampered_value=header_val,
+                            tampered_value=h_val,
                             evidence=(
-                                f"Header '{header_name}: {header_val}' returned HTTP 200 "
+                                f"Header '{h_name}: {h_val}' returned HTTP 200 "
                                 f"with sensitive content — access control bypassed via header"
                             ),
                             severity=SeverityLevel.CRITICAL,
                             description=(
-                                f"The server uses the '{header_name}' header to route or authorize requests. "
+                                f"The server uses the '{h_name}' header to route or authorize requests. "
                                 f"An attacker can supply this header to bypass access controls."
                             ),
                             remediation=(
@@ -640,9 +690,17 @@ async def test_header_bypass(
                                 "not the routing/proxy layer. Strip untrusted headers at the edge."
                             ),
                         ))
-                        return
+                        return True
             except Exception as e:
-                errors.append(f"Header bypass error '{header_name}': {str(e)}")
+                errors.append(f"Header bypass error '{h_name}': {str(e)}")
+            return False
+
+    header_tasks = []
+    for test_path in test_paths:
+        for header_template in BYPASS_HEADERS:
+            header_tasks.append(_test_header_path(test_path, header_template))
+    
+    await asyncio.gather(*header_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -693,26 +751,13 @@ async def run_bac_scan(
             **extra_headers,
         },
     ) as client:
-        # Verify reachable
+        # Soft reachability check — log the error but continue scanning.
+        # Forced browsing, header bypass, and path tests probe common paths on
+        # the base domain and remain valid even if this specific URL is slow/blocked.
         try:
-            await client.get(primary_url, timeout=timeout)
+            probe = await client.get(primary_url, timeout=timeout)
         except Exception as e:
-            return {
-                "url": primary_url,
-                "status": "unreachable",
-                "summary": BACSummary(
-                    total_checks=0,
-                    vulnerabilities_found=0,
-                    idor_findings=0,
-                    forced_browsing_findings=0,
-                    privilege_escalation_findings=0,
-                    missing_auth_findings=0,
-                    method_tampering_findings=0,
-                    risk_level=SeverityLevel.LOW,
-                ),
-                "findings": [],
-                "errors": [f"Could not reach target: {str(e)}"],
-            }
+            errors.append(f"Primary URL probe failed (continuing scan): {str(e)}")
 
         # Run testing for all URLs concurrently within limits
         for url in urls:

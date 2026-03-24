@@ -44,12 +44,12 @@ async def scan_bac(request: BACRequest):
         )
 
     result = await run_bac_scan(
-        urls=request.url,
+        urls=[request.url],
         timeout=request.timeout,
         cookies=request.cookies or {},
         extra_headers=request.headers or {},
     )
-    return BACResult(**result)
+    return BACResult.model_validate(result)
 
 
 # ──────────────────────────────────────────────
@@ -73,7 +73,7 @@ async def scan_bac_async(request: BACRequest, background_tasks: BackgroundTasks)
 
     async def _run():
         result = await run_bac_scan(
-            urls=request.url,
+            urls=[request.url],
             timeout=request.timeout,
             cookies=request.cookies or {},
             extra_headers=request.headers or {},

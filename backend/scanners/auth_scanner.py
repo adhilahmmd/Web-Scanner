@@ -284,21 +284,27 @@ async def probe_login_endpoints(
     """Discover all login endpoints and forms."""
     discovered = []
 
-    for path in LOGIN_PATHS:
-        target = base_url + path
-        checks.append(f"LOGIN_PROBE:{target}")
-        try:
-            resp = await client.get(target, timeout=timeout)
-            if resp.status_code in (200, 301, 302):
-                form = find_login_form(resp.text, target)
-                if form or "password" in resp.text.lower():
-                    discovered.append({
-                        "url": target,
-                        "status": resp.status_code,
-                        "form": form,
-                    })
-        except Exception:
-            pass
+    semaphore = asyncio.Semaphore(10)
+
+    async def _probe_path(path):
+        async with semaphore:
+            target = base_url + path
+            checks.append(f"LOGIN_PROBE:{target}")
+            try:
+                resp = await client.get(target, timeout=timeout)
+                if resp.status_code in (200, 301, 302):
+                    form = find_login_form(resp.text, target)
+                    if form or "password" in resp.text.lower():
+                        discovered.append({
+                            "url": target,
+                            "status": resp.status_code,
+                            "form": form,
+                        })
+            except Exception:
+                pass
+
+    tasks = [_probe_path(p) for p in LOGIN_PATHS]
+    await asyncio.gather(*tasks)
 
     if discovered:
         findings.append(AuthFinding(
@@ -362,51 +368,55 @@ async def test_weak_credentials(
         errors.append(f"Weak creds baseline failed: {str(e)}")
         return
 
-    for username, password in DEFAULT_CREDENTIALS:
-        checks.append(f"CREDS:{username}:{password}")
-        data = {**base_fields, username_field: username, password_field: password}
-        try:
-            if method == "post":
-                resp = await client.post(action, data=data,
-                                         timeout=timeout, follow_redirects=True)
-            else:
-                resp = await client.get(action, params=data,
-                                        timeout=timeout, follow_redirects=True)
+    semaphore = asyncio.Semaphore(5)
+    login_found = False
 
-            # Success indicators: redirect to dashboard, different page, no "invalid" text
-            failed_keywords = ["invalid", "incorrect", "wrong", "failed",
-                                "error", "denied", "unauthorized", "bad credentials"]
-            success_keywords = ["dashboard", "welcome", "logout", "profile",
-                                 "account", "signout", "log out", "my account"]
+    async def _test_cred(u, p):
+        nonlocal login_found
+        if login_found: return
+        async with semaphore:
+            checks.append(f"CREDS:{u}:{p}")
+            data = {**base_fields, username_field: u, password_field: p}
+            try:
+                if method == "post":
+                    resp = await client.post(action, data=data,
+                                             timeout=timeout, follow_redirects=True)
+                else:
+                    resp = await client.get(action, params=data,
+                                            timeout=timeout, follow_redirects=True)
 
-            response_lower = resp.text.lower()
-            has_success = any(kw in response_lower for kw in success_keywords)
-            has_failure = any(kw in response_lower for kw in failed_keywords)
-            size_diff = abs(len(resp.text) - baseline_len)
+                failed_keywords = ["invalid", "incorrect", "wrong", "failed",
+                                    "error", "denied", "unauthorized", "bad credentials"]
+                success_keywords = ["dashboard", "welcome", "logout", "profile",
+                                     "account", "signout", "log out", "my account"]
 
-            # Login succeeded if: success keywords present OR significant size diff without failure kw
-            if has_success and not has_failure:
-                findings.append(AuthFinding(
-                    check_type=AuthCheckType.WEAK_CREDENTIALS,
-                    target_url=action,
-                    evidence=f"Login succeeded with credentials: {username} / {password}",
-                    severity=SeverityLevel.CRITICAL,
-                    description=(
-                        f"The application accepted default/weak credentials '{username}:{password}'. "
-                        f"An attacker can gain unauthorized access without any prior knowledge."
-                    ),
-                    remediation=(
-                        "Remove all default accounts and credentials immediately. "
-                        "Enforce strong password policies. "
-                        "Implement MFA for all user accounts, especially admin."
-                    ),
-                    detail={"username": username, "password": password, "login_url": action},
-                ))
-                return  # Stop after first successful login
-        except httpx.TimeoutException:
-            errors.append(f"Timeout on credential test {username}:{password}")
-        except Exception as e:
-            errors.append(f"Credential test error: {str(e)}")
+                response_lower = resp.text.lower()
+                has_success = any(kw in response_lower for kw in success_keywords)
+                has_failure = any(kw in response_lower for kw in failed_keywords)
+
+                if has_success and not has_failure:
+                    findings.append(AuthFinding(
+                        check_type=AuthCheckType.WEAK_CREDENTIALS,
+                        target_url=action,
+                        evidence=f"Login succeeded with credentials: {u} / {p}",
+                        severity=SeverityLevel.CRITICAL,
+                        description=(
+                            f"The application accepted default/weak credentials '{u}:{p}'. "
+                            f"An attacker can gain unauthorized access without any prior knowledge."
+                        ),
+                        remediation=(
+                            "Remove all default accounts and credentials immediately. "
+                            "Enforce strong password policies. "
+                            "Implement MFA for all user accounts, especially admin."
+                        ),
+                        detail={"username": u, "password": p, "login_url": action},
+                    ))
+                    login_found = True
+            except Exception as e:
+                errors.append(f"Credential test error {u}:{p}: {str(e)}")
+
+    cred_tasks = [_test_cred(u, p) for u, p in DEFAULT_CREDENTIALS]
+    await asyncio.gather(*cred_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -512,67 +522,73 @@ async def test_cookie_flags(
     # Collect cookies from multiple pages
     pages_to_check = [url, login_url] if login_url != url else [url]
 
-    for page_url in pages_to_check:
-        try:
-            resp = await client.get(page_url, timeout=timeout)
-            raw_cookies = parse_set_cookie_headers(resp)
+    semaphore = asyncio.Semaphore(10)
 
-            for cookie in raw_cookies:
-                name = cookie["name"]
-                if not name:
-                    continue
+    async def _check_page_cookies(p_url):
+        async with semaphore:
+            try:
+                resp = await client.get(p_url, timeout=timeout)
+                raw_cookies = parse_set_cookie_headers(resp)
 
-                issues = []
-                is_session_cookie = any(
-                    p in name.lower() for p in SESSION_COOKIE_PATTERNS
-                )
+                for cookie in raw_cookies:
+                    name = cookie["name"]
+                    if not name:
+                        continue
 
-                if not cookie["http_only"]:
-                    issues.append("Missing HttpOnly flag — accessible via JavaScript (XSS risk)")
-                if not cookie["secure"] and is_https:
-                    issues.append("Missing Secure flag — transmitted over HTTP")
-                if not cookie["secure"] and not is_https:
-                    issues.append("Cookie sent over HTTP — no transport encryption")
-                if not cookie["same_site"]:
-                    issues.append("Missing SameSite flag — CSRF risk")
-                elif cookie["same_site"].lower() == "none" and not cookie["secure"]:
-                    issues.append("SameSite=None without Secure — invalid and insecure")
-                if not cookie["expires"] and is_session_cookie:
-                    issues.append("No expiry set — session persists until browser close")
+                    issues = []
+                    is_session_cookie = any(
+                        p in name.lower() for p in SESSION_COOKIE_PATTERNS
+                    )
 
-                cookie_details.append(CookieDetail(
-                    name=name,
-                    value_sample=cookie["value"][:12] + "..." if len(cookie["value"]) > 12 else cookie["value"],
-                    http_only=cookie["http_only"],
-                    secure=cookie["secure"],
-                    same_site=cookie["same_site"],
-                    path=cookie["path"],
-                    domain=cookie["domain"],
-                    expires=cookie["expires"],
-                    issues=issues,
-                ))
+                    if not cookie["http_only"]:
+                        issues.append("Missing HttpOnly flag — accessible via JavaScript (XSS risk)")
+                    if not cookie["secure"] and is_https:
+                        issues.append("Missing Secure flag — transmitted over HTTP")
+                    if not cookie["secure"] and not is_https:
+                        issues.append("Cookie sent over HTTP — no transport encryption")
+                    if not cookie["same_site"]:
+                        issues.append("Missing SameSite flag — CSRF risk")
+                    elif cookie["same_site"].lower() == "none" and not cookie["secure"]:
+                        issues.append("SameSite=None without Secure — invalid and insecure")
+                    if not cookie["expires"] and is_session_cookie:
+                        issues.append("No expiry set — session persists until browser close")
 
-                if issues and is_session_cookie:
-                    severity = SeverityLevel.HIGH if not cookie["http_only"] else SeverityLevel.MEDIUM
-                    findings.append(AuthFinding(
-                        check_type=AuthCheckType.COOKIE_FLAGS,
-                        target_url=page_url,
-                        evidence=f"Cookie '{name}' has {len(issues)} security issue(s): {'; '.join(issues)}",
-                        severity=severity,
-                        description=(
-                            f"Session cookie '{name}' is missing critical security flags. "
-                            + " ".join(issues)
-                        ),
-                        remediation=(
-                            "Set HttpOnly to prevent JS access. "
-                            "Set Secure to enforce HTTPS-only transmission. "
-                            "Set SameSite=Strict or Lax to prevent CSRF. "
-                            "Set a reasonable expiry time for session cookies."
-                        ),
-                        detail={"cookie_name": name, "issues": issues},
+                    cookie_details.append(CookieDetail(
+                        name=name,
+                        value_sample=cookie["value"][:12] + "..." if len(cookie["value"]) > 12 else cookie["value"],
+                        http_only=cookie["http_only"],
+                        secure=cookie["secure"],
+                        same_site=cookie["same_site"],
+                        path=cookie["path"],
+                        domain=cookie["domain"],
+                        expires=cookie["expires"],
+                        issues=issues,
                     ))
-        except Exception as e:
-            errors.append(f"Cookie flag check error on {page_url}: {str(e)}")
+
+                    if issues and is_session_cookie:
+                        severity = SeverityLevel.HIGH if not cookie["http_only"] else SeverityLevel.MEDIUM
+                        findings.append(AuthFinding(
+                            check_type=AuthCheckType.COOKIE_FLAGS,
+                            target_url=p_url,
+                            evidence=f"Cookie '{name}' has {len(issues)} security issue(s): {'; '.join(issues)}",
+                            severity=severity,
+                            description=(
+                                f"Session cookie '{name}' is missing critical security flags. "
+                                + " ".join(issues)
+                            ),
+                            remediation=(
+                                "Set HttpOnly to prevent JS access. "
+                                "Set Secure to enforce HTTPS-only transmission. "
+                                "Set SameSite=Strict or Lax to prevent CSRF. "
+                                "Set a reasonable expiry time for session cookies."
+                            ),
+                            detail={"cookie_name": name, "issues": issues},
+                        ))
+            except Exception as e:
+                errors.append(f"Cookie flag check error on {p_url}: {str(e)}")
+
+    cookie_tasks = [_check_page_cookies(p) for p in pages_to_check]
+    await asyncio.gather(*cookie_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -593,81 +609,87 @@ async def test_session_token_entropy(
     pages = [url, login_url] if login_url != url else [url]
     tokens_seen = []
 
-    for page_url in pages:
-        try:
-            # Fetch multiple times to compare tokens
-            for _ in range(3):
-                resp = await client.get(page_url, timeout=timeout)
-                raw_cookies = parse_set_cookie_headers(resp)
-                for cookie in raw_cookies:
-                    name = cookie["name"]
-                    value = cookie["value"]
-                    if not value or len(value) < 4:
-                        continue
-                    if any(p in name.lower() for p in SESSION_COOKIE_PATTERNS):
-                        tokens_seen.append((name, value))
+    semaphore = asyncio.Semaphore(5)
 
-                        entropy = calculate_entropy(value)
-                        predictable = is_predictable_token(value)
-                        charset = analyze_charset(value)
+    async def _analyze_token(p_url):
+        async with semaphore:
+            try:
+                # Fetch multiple times to compare tokens
+                for _ in range(3):
+                    resp = await client.get(p_url, timeout=timeout)
+                    raw_cookies = parse_set_cookie_headers(resp)
+                    for cookie in raw_cookies:
+                        name = cookie["name"]
+                        value = cookie["value"]
+                        if not value or len(value) < 4:
+                            continue
+                        if any(p in name.lower() for p in SESSION_COOKIE_PATTERNS):
+                            tokens_seen.append((name, value))
 
-                        detail = TokenEntropyDetail(
-                            token_sample=value[:16] + "..." if len(value) > 16 else value,
-                            length=len(value),
-                            entropy_bits=entropy,
-                            is_predictable=predictable,
-                            charset_analysis=charset,
-                        )
-                        token_analysis.append(detail)
+                            entropy = calculate_entropy(value)
+                            predictable = is_predictable_token(value)
+                            charset = analyze_charset(value)
 
-                        # JWT specific checks
-                        if is_jwt(value):
-                            jwt_header = decode_jwt_header(value)
-                            if jwt_header and jwt_header.get("alg", "").upper() in ("NONE", "HS256"):
-                                alg = jwt_header.get("alg", "")
+                            detail = TokenEntropyDetail(
+                                token_sample=value[:16] + "..." if len(value) > 16 else value,
+                                length=len(value),
+                                entropy_bits=entropy,
+                                is_predictable=predictable,
+                                charset_analysis=charset,
+                             )
+                            token_analysis.append(detail)
+
+                            # JWT specific checks
+                            if is_jwt(value):
+                                jwt_header = decode_jwt_header(value)
+                                if jwt_header and jwt_header.get("alg", "").upper() in ("NONE", "HS256"):
+                                    alg = jwt_header.get("alg", "")
+                                    findings.append(AuthFinding(
+                                        check_type=AuthCheckType.SESSION_TOKEN,
+                                        target_url=p_url,
+                                        evidence=f"JWT token uses algorithm: '{alg}'",
+                                        severity=SeverityLevel.CRITICAL if alg.upper() == "NONE" else SeverityLevel.HIGH,
+                                        description=(
+                                            f"JWT token in cookie '{name}' uses '{alg}' algorithm. "
+                                            + ("'none' algorithm disables signature verification entirely." if alg.upper() == "NONE"
+                                               else "HS256 is vulnerable to brute-force if a weak secret is used.")
+                                        ),
+                                        remediation=(
+                                            "Use RS256 or ES256 for JWT signing. "
+                                            "Never accept 'none' algorithm. "
+                                            "Use a strong, random secret (minimum 256 bits) for HS256."
+                                        ),
+                                        detail={"jwt_header": jwt_header, "cookie": name},
+                                    ))
+
+                            if predictable or entropy < 40:
                                 findings.append(AuthFinding(
                                     check_type=AuthCheckType.SESSION_TOKEN,
-                                    target_url=page_url,
-                                    evidence=f"JWT token uses algorithm: '{alg}'",
-                                    severity=SeverityLevel.CRITICAL if alg.upper() == "NONE" else SeverityLevel.HIGH,
+                                    target_url=p_url,
+                                    evidence=(
+                                        f"Cookie '{name}' — entropy: {entropy} bits, "
+                                        f"length: {len(value)}, charset: {charset}, "
+                                        f"predictable: {predictable}"
+                                    ),
+                                    severity=SeverityLevel.HIGH if predictable else SeverityLevel.MEDIUM,
                                     description=(
-                                        f"JWT token in cookie '{name}' uses '{alg}' algorithm. "
-                                        + ("'none' algorithm disables signature verification entirely." if alg.upper() == "NONE"
-                                           else "HS256 is vulnerable to brute-force if a weak secret is used.")
+                                        f"Session token '{name}' has low entropy ({entropy} bits) "
+                                        f"or shows signs of predictability. "
+                                        f"Weak tokens can be guessed or brute-forced."
                                     ),
                                     remediation=(
-                                        "Use RS256 or ES256 for JWT signing. "
-                                        "Never accept 'none' algorithm. "
-                                        "Use a strong, random secret (minimum 256 bits) for HS256."
+                                        "Use a cryptographically secure random number generator (CSPRNG) "
+                                        "for all session tokens. "
+                                        "Minimum token length: 128 bits (16 bytes) of entropy. "
+                                        "Use frameworks' built-in session managers."
                                     ),
-                                    detail={"jwt_header": jwt_header, "cookie": name},
+                                    detail=detail.model_dump(),
                                 ))
+            except Exception as e:
+                errors.append(f"Token entropy check error on {p_url}: {str(e)}")
 
-                        if predictable or entropy < 40:
-                            findings.append(AuthFinding(
-                                check_type=AuthCheckType.SESSION_TOKEN,
-                                target_url=page_url,
-                                evidence=(
-                                    f"Cookie '{name}' — entropy: {entropy} bits, "
-                                    f"length: {len(value)}, charset: {charset}, "
-                                    f"predictable: {predictable}"
-                                ),
-                                severity=SeverityLevel.HIGH if predictable else SeverityLevel.MEDIUM,
-                                description=(
-                                    f"Session token '{name}' has low entropy ({entropy} bits) "
-                                    f"or shows signs of predictability. "
-                                    f"Weak tokens can be guessed or brute-forced."
-                                ),
-                                remediation=(
-                                    "Use a cryptographically secure random number generator (CSPRNG) "
-                                    "for all session tokens. "
-                                    "Minimum token length: 128 bits (16 bytes) of entropy. "
-                                    "Use frameworks' built-in session managers."
-                                ),
-                                detail=detail.model_dump(),
-                            ))
-        except Exception as e:
-            errors.append(f"Token entropy check error: {str(e)}")
+    token_tasks = [_analyze_token(p) for p in pages]
+    await asyncio.gather(*token_tasks)
 
     # Check token uniqueness across requests
     if len(tokens_seen) >= 2:
@@ -878,50 +900,55 @@ async def test_password_policy(
         "/create-account", "/new-account",
     ]
 
-    for path in register_paths:
-        target = base_url + path
-        checks.append(f"POLICY:{target}")
-        try:
-            resp = await client.get(target, timeout=timeout)
-            if resp.status_code != 200:
-                continue
+    semaphore = asyncio.Semaphore(5)
 
-            html = resp.text.lower()
-            has_register_form = (
-                "password" in html and
-                ("register" in html or "sign up" in html or "create" in html)
-            )
+    async def _check_register_path(path):
+        async with semaphore:
+            target = base_url + path
+            checks.append(f"POLICY:{target}")
+            try:
+                resp = await client.get(target, timeout=timeout)
+                if resp.status_code != 200:
+                    return
 
-            if has_register_form:
-                # Look for password policy hints
-                policy_keywords = ["must contain", "minimum", "uppercase",
-                                    "special character", "at least", "strength"]
-                has_policy = any(kw in html for kw in policy_keywords)
+                html = resp.text.lower()
+                has_register_form = (
+                    "password" in html and
+                    ("register" in html or "sign up" in html or "create" in html)
+                )
 
-                if not has_policy:
-                    findings.append(AuthFinding(
-                        check_type=AuthCheckType.PASSWORD_POLICY,
-                        target_url=target,
-                        evidence=(
-                            f"Registration form at '{target}' found with no visible "
-                            f"password strength requirements or policy hints"
-                        ),
-                        severity=SeverityLevel.MEDIUM,
-                        description=(
-                            "The registration page does not appear to enforce or communicate "
-                            "a password policy. Users may be able to set weak passwords."
-                        ),
-                        remediation=(
-                            "Enforce minimum password length of 12 characters. "
-                            "Require a mix of uppercase, lowercase, digits, and special chars. "
-                            "Check passwords against known breach databases (HaveIBeenPwned API). "
-                            "Show a real-time password strength meter to users."
-                        ),
-                        detail={"registration_url": target},
-                    ))
-                break
-        except Exception:
-            pass
+                if has_register_form:
+                    # Look for password policy hints
+                    policy_keywords = ["must contain", "minimum", "uppercase",
+                                        "special character", "at least", "strength"]
+                    has_policy = any(kw in html for kw in policy_keywords)
+
+                    if not has_policy:
+                        findings.append(AuthFinding(
+                            check_type=AuthCheckType.PASSWORD_POLICY,
+                            target_url=target,
+                            evidence=(
+                                f"Registration form at '{target}' found with no visible "
+                                f"password strength requirements or policy hints"
+                            ),
+                            severity=SeverityLevel.MEDIUM,
+                            description=(
+                                "The registration page does not appear to enforce or communicate "
+                                "a password policy. Users may be able to set weak passwords."
+                            ),
+                            remediation=(
+                                "Enforce minimum password length of 12 characters. "
+                                "Require a mix of uppercase, lowercase, digits, and special chars. "
+                                "Check passwords against known breach databases (HaveIBeenPwned API). "
+                                "Show a real-time password strength meter to users."
+                            ),
+                            detail={"registration_url": target},
+                        ))
+            except Exception:
+                pass
+
+    policy_tasks = [_check_register_path(p) for p in register_paths]
+    await asyncio.gather(*policy_tasks)
 
 
 # ──────────────────────────────────────────────
@@ -952,19 +979,26 @@ async def test_multi_session(
     # Use separate client instances to simulate two browsers
     try:
         tokens = []
-        for _ in range(2):
+        async def _get_token_for_sim():
             async with httpx.AsyncClient(follow_redirects=True) as temp_client:
                 data = {**base_fields, username_field: "test", password_field: "test"}
-                if method == "post":
-                    resp = await temp_client.post(action, data=data, timeout=timeout)
-                else:
-                    resp = await temp_client.get(action, params=data, timeout=timeout)
+                try:
+                    if method == "post":
+                        resp = await temp_client.post(action, data=data, timeout=timeout)
+                    else:
+                        resp = await temp_client.get(action, params=data, timeout=timeout)
 
-                raw_cookies = parse_set_cookie_headers(resp)
-                for c in raw_cookies:
-                    if any(p in c["name"].lower() for p in SESSION_COOKIE_PATTERNS):
-                        tokens.append(c["value"])
-                        break
+                    raw_cookies = parse_set_cookie_headers(resp)
+                    for c in raw_cookies:
+                        if any(p in c["name"].lower() for p in SESSION_COOKIE_PATTERNS):
+                            return c["value"]
+                except Exception:
+                    pass
+            return None
+
+        sim_tasks = [_get_token_for_sim() for _ in range(2)]
+        results = await asyncio.gather(*sim_tasks)
+        tokens = [t for t in results if t]
 
         if len(tokens) == 2 and tokens[0] != tokens[1]:
             findings.append(AuthFinding(

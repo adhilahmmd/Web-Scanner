@@ -175,10 +175,16 @@ async def probe_hidden_paths(
     parsed = urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     found = []
+    
+    semaphore = asyncio.Semaphore(10)  # limit to 10 concurrent requests
+
+    async def _sem_probe(path):
+        async with semaphore:
+            return await _probe_single_path(client, base + path, timeout)
 
     tasks = []
     for path in HIDDEN_PATHS:
-        tasks.append(_probe_single_path(client, base + path, timeout))
+        tasks.append(_sem_probe(path))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for path, result in zip(HIDDEN_PATHS, results):

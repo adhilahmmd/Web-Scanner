@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import asyncio
 import uuid
+from fastapi.encoders import jsonable_encoder
 
 from sqlalchemy.orm import Session
 
@@ -81,7 +82,7 @@ async def _run_module(module: str, urls: List[str], timeout: int) -> tuple[str, 
         elif module == "xss":
             result = await run_xss_scan(urls=urls, timeout=timeout, test_forms=True, test_headers=True, test_json=True)
         elif module == "bac":
-            result = await run_bac_scan(urls=urls, timeout=timeout, cookies=None, extra_headers=None)
+            result = await run_bac_scan(urls=urls, timeout=timeout, cookies={}, extra_headers={})
         elif module == "auth":
             result = await run_auth_scan(urls=urls, login_path="/login", username_field="username",
                                           password_field="password", timeout=timeout, cookies=None)
@@ -142,7 +143,7 @@ def _save_scan_to_db(
         user_id=user.id,
         target_url=result.url,
         modules_run=json.dumps(result.modules_requested),
-        result_json=json.dumps(result.results),
+        result_json=json.dumps(jsonable_encoder(result.results)),
         risk_level=result.overall_risk,
         critical_count=result.critical_count,
         high_count=result.high_count,
@@ -165,6 +166,7 @@ async def _run_all_modules(
     max_depth: int = 2,
     max_pages: int = 20,
     scan_all_links: bool = True,
+    job_id: Optional[str] = None,
 ) -> tuple[UnifiedScanResult, int]:
     """Run all requested modules, running crawler first if needed. Returns (result, duration_seconds)."""
     valid_modules = [m for m in modules if m in AVAILABLE_MODULES]
@@ -175,11 +177,17 @@ async def _run_all_modules(
     failed = []
     
     # 1. Pipeline Stage 1: Discovery (Crawler)
+    if job_id and job_id in unified_jobs:
+        unified_jobs[job_id]["progress"] = 5
+        unified_jobs[job_id]["status_message"] = "Starting discovery phase..."
+
     target_urls = [url]
     run_crawler_explicitly = "crawler" in valid_modules
     needs_crawling = use_crawler and any(m in ["sqli", "xss", "bac", "auth"] for m in valid_modules)
 
     if use_crawler and (needs_crawling or run_crawler_explicitly):
+        if job_id and job_id in unified_jobs:
+            unified_jobs[job_id]["status_message"] = "Crawling target for endpoints..."
         try:
             from scanners.crawler_scanner import run_crawler
             crawler_result = await run_crawler(
@@ -217,18 +225,37 @@ async def _run_all_modules(
                 results["crawler"] = {"error": str(e)}
                 failed.append("crawler")
 
+        if job_id and job_id in unified_jobs:
+            unified_jobs[job_id]["progress"] = 20
+            unified_jobs[job_id]["status_message"] = f"Discovered {len(target_urls)} endpoints for scanning"
+
     # 2. Pipeline Stage 2: Assessment (Scanners)
     remaining_modules = [m for m in valid_modules if m != "crawler"]
+    
+    if job_id and job_id in unified_jobs:
+        unified_jobs[job_id]["status_message"] = f"Starting vulnerability assessment ({len(remaining_modules)} modules)..."
+    
     tasks = [_run_module(m, target_urls, timeout) for m in remaining_modules]
     
     if tasks:
         raw_results = await asyncio.gather(*tasks, return_exceptions=False)
         for module_name, data in raw_results:
             results[module_name] = data
-            if isinstance(data, dict) and "error" in data:
+            is_error = isinstance(data, dict) and (
+                "error" in data
+                or data.get("status") in ("unreachable", "failed")
+            )
+            if is_error:
                 failed.append(module_name)
             else:
                 completed.append(module_name)
+            
+            if job_id and job_id in unified_jobs:
+                completed_count = len(completed) + len(failed)
+                total_to_run = len(remaining_modules)
+                progress_step = int((completed_count / total_to_run) * 70) + 25
+                unified_jobs[job_id]["progress"] = min(95, progress_step)
+                unified_jobs[job_id]["status_message"] = f"Completed {module_name} scan..."
             
     duration = int(time.monotonic() - start)
 
@@ -310,12 +337,17 @@ async def unified_scan_async(
     async def _run():
         from database.db import SessionLocal as _SL
         try:
-            result, duration = await _run_all_modules(
-                request.url, request.modules, request.timeout,
-                use_crawler=request.use_crawler,
-                max_depth=request.max_depth,
-                max_pages=request.max_pages,
-                scan_all_links=request.scan_all_links,
+            # Set a global timeout for the entire scan process (e.g., 10 minutes)
+            result, duration = await asyncio.wait_for(
+                _run_all_modules(
+                    request.url, request.modules, request.timeout,
+                    use_crawler=request.use_crawler,
+                    max_depth=request.max_depth,
+                    max_pages=request.max_pages,
+                    scan_all_links=request.scan_all_links,
+                    job_id=job_id
+                ),
+                timeout=600  # 10 minutes max for internal safety
             )
 
             history_id = None
@@ -335,6 +367,14 @@ async def unified_scan_async(
                 "status": "completed",
                 "progress": 100,
                 "result": result.model_dump(),
+                "url": request.url,
+            }
+        except asyncio.TimeoutError:
+            unified_jobs[job_id] = {
+                "status": "failed",
+                "progress": 0,
+                "result": None,
+                "error": "Global scan timeout reached (10 minutes). Target may be too large or slow.",
                 "url": request.url,
             }
         except Exception as e:
@@ -358,23 +398,8 @@ async def unified_scan_async(
 
 
 # ──────────────────────────────────────────────
-# GET /api/scan/{job_id}  — poll job status
-# ──────────────────────────────────────────────
-@router.get("/{job_id}", summary="Get Async Unified Scan Result")
-async def get_unified_result(job_id: str):
-    """Poll the result of a previously submitted async unified scan."""
-    job = unified_jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
-
-    if job["status"] == "running":
-        return {"job_id": job_id, "status": "running", "progress": job.get("progress", 0), "result": None}
-
-    return {"job_id": job_id, "status": job["status"], "progress": 100, "result": job.get("result"), "error": job.get("error")}
-
-
-# ──────────────────────────────────────────────
 # GET /api/scan/modules/list  — list available modules
+# IMPORTANT: must be declared BEFORE /{job_id} to avoid wildcard match
 # ──────────────────────────────────────────────
 @router.get("/modules/list", summary="List Available Scan Modules")
 async def list_modules():
@@ -390,3 +415,19 @@ async def list_modules():
             {"id": "headers", "name": "HTTP Security Headers", "description": "Analyzes CSP, HSTS, X-Frame-Options and more"},
         ]
     }
+
+
+# ──────────────────────────────────────────────
+# GET /api/scan/{job_id}  — poll job status
+# ──────────────────────────────────────────────
+@router.get("/{job_id}", summary="Get Async Unified Scan Result")
+async def get_unified_result(job_id: str):
+    """Poll the result of a previously submitted async unified scan."""
+    job = unified_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    if job["status"] == "running":
+        return {"job_id": job_id, "status": "running", "progress": job.get("progress", 0), "result": None}
+
+    return {"job_id": job_id, "status": job["status"], "progress": 100, "result": job.get("result"), "error": job.get("error")}

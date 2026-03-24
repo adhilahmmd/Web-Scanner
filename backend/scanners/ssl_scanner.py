@@ -285,7 +285,7 @@ def check_certificate(
 # 2. Protocol Version Support
 # ──────────────────────────────────────────────
 
-def check_protocol_versions(
+async def check_protocol_versions(
     host: str,
     port: int,
     timeout: int,
@@ -303,7 +303,7 @@ def check_protocol_versions(
         ("TLSv1.3", ssl.TLSVersion.TLSv1_3,  "tls13",  SeverityLevel.INFO),
     ]
 
-    for proto_name, tls_version, attr, severity in protocol_tests:
+    async def _test_proto(proto_name, tls_version, attr, severity):
         checks.append(f"PROTO:{proto_name}")
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -311,39 +311,47 @@ def check_protocol_versions(
             ctx.verify_mode = ssl.CERT_NONE
             ctx.minimum_version = tls_version
             ctx.maximum_version = tls_version
+            # Some old protocols like SSLv2/v3 may not be supported by the current SSLContext.
+            # But the protocol_tests list currently only has TLS.
 
-            with socket.create_connection((host, port), timeout=timeout) as sock:
-                with ctx.wrap_socket(sock, server_hostname=host):
-                    setattr(support, attr, True)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+                timeout=timeout
+            )
+            setattr(support, attr, True)
+            writer.close()
+            await writer.wait_closed()
 
-                    if severity in (SeverityLevel.HIGH, SeverityLevel.MEDIUM, SeverityLevel.CRITICAL):
-                        findings.append(SSLFinding(
-                            check_type=SSLCheckType.PROTOCOL_VERSION,
-                            target=f"{host}:{port}",
-                            evidence=f"Server accepted {proto_name} connection successfully",
-                            severity=severity,
-                            description=(
-                                f"The server supports {proto_name} which is deprecated and insecure. "
-                                + WEAK_PROTOCOLS.get(proto_name, ("", SeverityLevel.MEDIUM, ""))[2]
-                            ),
-                            remediation=(
-                                f"Disable {proto_name} in your server configuration. "
-                                "Only TLS 1.2 and TLS 1.3 should be enabled. "
-                                "Update your web server config: "
-                                "Nginx: ssl_protocols TLSv1.2 TLSv1.3; "
-                                "Apache: SSLProtocol -all +TLSv1.2 +TLSv1.3"
-                            ),
-                            detail={"protocol": proto_name},
-                        ))
-        except ssl.SSLError:
+            if severity in (SeverityLevel.HIGH, SeverityLevel.MEDIUM, SeverityLevel.CRITICAL):
+                findings.append(SSLFinding(
+                    check_type=SSLCheckType.PROTOCOL_VERSION,
+                    target=f"{host}:{port}",
+                    evidence=f"Server accepted {proto_name} connection successfully",
+                    severity=severity,
+                    description=(
+                        f"The server supports {proto_name} which is deprecated and insecure. "
+                        + WEAK_PROTOCOLS.get(proto_name, ("", SeverityLevel.MEDIUM, ""))[2]
+                    ),
+                    remediation=(
+                        f"Disable {proto_name} in your server configuration. "
+                        "Only TLS 1.2 and TLS 1.3 should be enabled. "
+                        "Update your web server config: "
+                        "Nginx: ssl_protocols TLSv1.2 TLSv1.3; "
+                        "Apache: SSLProtocol -all +TLSv1.2 +TLSv1.3"
+                    ),
+                    detail={"protocol": proto_name},
+                ))
+        except (ssl.SSLError, ConnectionResetError):
             pass  # Protocol not supported = good
-        except (socket.timeout, ConnectionRefusedError):
+        except asyncio.TimeoutError:
             errors.append(f"Timeout testing {proto_name} on {host}:{port}")
         except AttributeError:
-            # Some Python versions don't have all TLS version attrs
-            pass
+             pass
         except Exception as e:
             errors.append(f"Protocol test error for {proto_name}: {str(e)}")
+
+    tasks = [_test_proto(*pt) for pt in protocol_tests]
+    await asyncio.gather(*tasks)
 
     # Check if TLS 1.2+ not supported at all
     if not support.tls12 and not support.tls13:
@@ -898,17 +906,23 @@ async def run_ssl_scan(url: str, timeout: int = 10) -> dict:
             # Run sync checks in executor (socket/ssl operations)
             loop = asyncio.get_event_loop()
 
-            cert_detail = await loop.run_in_executor(
+            # Run sync checks in executor concurrently
+            cert_task = loop.run_in_executor(
                 None, check_certificate, host, port, timeout, findings, errors, checks
             )
-            protocol_support = await loop.run_in_executor(
-                None, check_protocol_versions, host, port, timeout, findings, errors, checks
-            )
-            cipher_details = await loop.run_in_executor(
+            # Async checks
+            proto_task = check_protocol_versions(host, port, timeout, findings, errors, checks)
+            
+            cipher_task = loop.run_in_executor(
                 None, check_cipher_suites, host, port, timeout, findings, errors, checks
             )
-            await loop.run_in_executor(
+            crime_task = loop.run_in_executor(
                 None, check_crime_breach, host, port, timeout, findings, errors, checks
+            )
+
+            # Gather results
+            cert_detail, protocol_support, cipher_details, _ = await asyncio.gather(
+                cert_task, proto_task, cipher_task, crime_task
             )
 
             # Async checks

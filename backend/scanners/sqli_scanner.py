@@ -331,11 +331,20 @@ async def run_sqli_scan(urls: List[str], timeout: int = 10) -> dict:
                 errors.append(f"Could not reach target URL {url}: {str(e)}")
                 continue
 
-            # Test each parameter
-            for param in params:
-                await test_error_based(client, url, param, timeout, findings, errors, payloads_tested)
-                await test_boolean_based(client, url, param, timeout, findings, errors, payloads_tested, baseline_length)
-                await test_time_based(client, url, param, timeout, findings, errors, payloads_tested)
+            # Test each parameter concurrently with a limit
+            semaphore = asyncio.Semaphore(5)  # max 5 concurrent tests for this site
+
+            async def _test_param(p):
+                async with semaphore:
+                    tasks = [
+                        test_error_based(client, url, p, timeout, findings, errors, payloads_tested),
+                        test_boolean_based(client, url, p, timeout, findings, errors, payloads_tested, baseline_length),
+                        test_time_based(client, url, p, timeout, findings, errors, payloads_tested),
+                    ]
+                    await asyncio.gather(*tasks)
+
+            param_tasks = [_test_param(param) for param in params]
+            await asyncio.gather(*param_tasks)
 
     # Deduplicate findings by parameter and url
     seen = set()
