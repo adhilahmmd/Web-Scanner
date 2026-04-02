@@ -184,6 +184,10 @@ async function launchScan() {
     goToStep(2);
     return;
   }
+  
+  if (useCrawler && !modules.includes('crawler')) {
+    modules.push('crawler');
+  }
   const scanAllLinks = $('input[name="scan-scope"][value="all"]')?.checked ?? true;
 
   const crawlerConfig = { use_crawler: useCrawler, max_depth: maxDepth, max_pages: maxPages, scan_all_links: scanAllLinks };
@@ -305,6 +309,7 @@ function buildFindingsList(moduleResults, modules) {
   for (const mod of modules) {
     const data = moduleResults[mod];
     if (!data || data.error) continue;
+
     const findings = Array.isArray(data.findings) ? data.findings : [];
     for (const f of findings) {
       all.push({ ...f, _module: mod });
@@ -362,7 +367,7 @@ function renderResults(result) {
   $('#results-empty').classList.add('hidden');
   $('#results-content').classList.remove('hidden');
   $('#copy-json-btn').disabled = false;
-  $('#download-json-btn').disabled = false;
+  $('#download-report-btn').disabled = false;
   $('#results-subtitle').textContent = `Scanned: ${result.url} — ${result.total_vulnerabilities} findings`;
 
   const risk = result.overall_risk || 'info';
@@ -400,6 +405,32 @@ function renderModuleStatus(result) {
     const data = result.results?.[mod];
     const failed = result.modules_failed?.includes(mod);
     const findings = Array.isArray(data?.findings) ? data.findings : [];
+    
+    if (mod === 'crawler') {
+      const pagesCount = Array.isArray(data?.pages_crawled) ? data.pages_crawled.length : 0;
+      const linksCount = Array.isArray(data?.all_links) ? data.all_links.length : 0;
+      
+      let rowStyle = 'display: flex; align-items: center; gap: 8px;';
+      let rowAction = '';
+      
+      if (!failed && (linksCount > 0 || data?.api_endpoints?.length > 0 || data?.forms?.length > 0)) {
+        rowStyle += ' cursor: pointer;';
+        rowAction = `onclick="window.app.openCrawlerModal()" title="Click to view crawler data"`;
+      }
+
+      let badgeClass = failed ? 'badge-error' : 'badge-info';
+      let badgeText = failed ? 'Error' : 'Data Ready';
+
+      return `
+        <div class="module-status-item crawler-status-item" style="${rowStyle}" ${rowAction}>
+          <span class="module-status-name">${MODULE_NAMES[mod] || mod}</span>
+          <span class="module-status-badge ${badgeClass}">${badgeText}</span>
+          <span class="module-status-count" style="flex: 1;">${linksCount} links · ${pagesCount} pages</span>
+        </div>
+      `;
+    }
+
+    // Default module logic
     const criticalCount = findings.filter(f => (f.severity || '').toLowerCase() === 'critical').length;
     const hasFindings = findings.length > 0;
 
@@ -413,13 +444,12 @@ function renderModuleStatus(result) {
     let extra = '';
     if (mod === 'headers' && data?.summary?.grade) extra = ` · Grade ${data.summary.grade}`;
     if (mod === 'ssl' && data?.summary?.grade) extra = ` · Grade ${data.summary.grade}`;
-    if (mod === 'crawler' && data?.pages_crawled !== undefined) extra = ` · ${data.pages_crawled} pages`;
 
     return `
-      <div class="module-status-item">
+      <div class="module-status-item" style="display: flex; align-items: center; gap: 8px;">
         <span class="module-status-name">${MODULE_NAMES[mod] || mod}</span>
         <span class="module-status-badge ${badgeClass}">${badgeText}</span>
-        <span class="module-status-count">${findings.length} findings${extra}</span>
+        <span class="module-status-count" style="flex: 1;">${findings.length} findings${extra}</span>
       </div>
     `;
   }).join('');
@@ -527,6 +557,60 @@ function openFindingModal(finding) {
   document.body.style.overflow = 'hidden';
 }
 
+function openCrawlerModal() {
+  const modal = $('#modal-overlay');
+  const title = $('#modal-title');
+  const body  = $('#modal-body');
+  if (!modal || !state.scanResults || !state.scanResults.results.crawler) return;
+
+  const data = state.scanResults.results.crawler;
+  title.textContent = 'Web Crawler Data';
+
+  const rows = [];
+
+  if (data.pages_crawled && data.pages_crawled.length > 0) {
+    rows.push({ label: `Crawled Pages (${data.pages_crawled.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(data.pages_crawled.join('\\n'))}</div>`, raw: true });
+  }
+  if (data.all_links && data.all_links.length > 0) {
+    rows.push({ label: `Discovered Links (${data.all_links.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(data.all_links.join('\\n'))}</div>`, raw: true });
+  }
+  if (data.api_endpoints && data.api_endpoints.length > 0) {
+    const eps = data.api_endpoints.map(e => typeof e === 'string' ? e : e.endpoint || JSON.stringify(e));
+    rows.push({ label: `API Endpoints (${eps.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(eps.join('\\n'))}</div>`, raw: true });
+  }
+  if (data.forms && data.forms.length > 0) {
+    const formsStr = data.forms.map(f => {
+       let str = `Action: ${f.action} | Method: ${f.method}`;
+       if (f.inputs && f.inputs.length > 0) {
+         const inputsStr = f.inputs.map(i => `${i.name || 'unnamed'}(${i.input_type || 'text'})`).join(', ');
+         str += ` | Inputs: [ ${inputsStr} ]`;
+       }
+       return str;
+    }).join('\\n\\n');
+    rows.push({ label: `Discovered Forms (${data.forms.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(formsStr)}</div>`, raw: true });
+  }
+  if (data.hidden_paths && data.hidden_paths.length > 0) {
+    rows.push({ label: `Hidden Paths (${data.hidden_paths.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(data.hidden_paths.join('\\n'))}</div>`, raw: true });
+  }
+  if (data.js_files && data.js_files.length > 0) {
+    rows.push({ label: `JS Files (${data.js_files.length})`, value: `<div class="detail-value monospace" style="max-height:150px; overflow-y:auto; white-space:pre-wrap;">${escapeHtml(data.js_files.join('\\n'))}</div>`, raw: true });
+  }
+
+  if (rows.length === 0) {
+    body.innerHTML = '<p style="padding:16px;">No crawler data found.</p>';
+  } else {
+    body.innerHTML = rows.map(r => `
+      <div class="detail-row">
+        <span class="detail-label">${r.label}</span>
+        ${r.raw ? r.value : `<div class="detail-value">${escapeHtml(String(r.value))}</div>`}
+      </div>
+    `).join('');
+  }
+
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+}
+
 function closeFindingModal() {
   $('#modal-overlay')?.classList.add('hidden');
   document.body.style.overflow = '';
@@ -535,8 +619,24 @@ function closeFindingModal() {
 /* ══════════════════════════════════════════════
    Export Helpers
    ══════════════════════════════════════════════ */
+function showDownloadModal() {
+  if (!state.scanResults) return;
+  const overlay = $('#download-modal-overlay');
+  if (overlay) {
+    overlay.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+  }
+}
+
+function closeDownloadModal() {
+  const overlay = $('#download-modal-overlay');
+  if (overlay) overlay.classList.add('hidden');
+  document.body.style.overflow = '';
+}
+
 function exportJSON() {
   if (!state.scanResults) return;
+  closeDownloadModal();
   const json = JSON.stringify(state.scanResults, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url  = URL.createObjectURL(blob);
@@ -545,7 +645,103 @@ function exportJSON() {
   a.download = `websecuity-scan-${Date.now()}.json`;
   a.click();
   URL.revokeObjectURL(url);
-  toast('Report downloaded!', 'success');
+  toast('JSON report downloaded!', 'success');
+}
+
+function exportPDF() {
+  if (!state.scanResults) return;
+  closeDownloadModal();
+
+  const r = state.scanResults;
+  const findings = state.allFindings;
+  const ts = new Date().toLocaleString();
+  const SEV_COLORS_PDF = {
+    critical: '#ff2d55', high: '#ff6b35', medium: '#ffd60a', low: '#34c759', info: '#636e7b'
+  };
+
+  const findingRows = findings.map(f => {
+    const sev = (f.severity || 'info').toLowerCase();
+    const col = SEV_COLORS_PDF[sev] || '#636e7b';
+    const mod = MODULE_NAMES[f._module] || f._module || '—';
+    const desc = escapeHtml((f.description || f.evidence || '—').substring(0, 180));
+    const param = escapeHtml(f.parameter || f.header_name || f.check_type || '—');
+    return `
+      <tr>
+        <td><span style="background:${col}22;color:${col};border:1px solid ${col}44;border-radius:4px;padding:2px 7px;font-size:11px;font-weight:700">${sev.toUpperCase()}</span></td>
+        <td style="color:#7b2fff;font-weight:600">${mod}</td>
+        <td>${desc}</td>
+        <td style="font-family:monospace;font-size:11px">${param}</td>
+      </tr>`;
+  }).join('');
+
+  const riskColor = SEV_COLORS_PDF[r.overall_risk] || '#636e7b';
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebSecuity Scan Report</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; color: #1a1a2e; background: #fff; font-size: 13px; line-height: 1.6; }
+  .cover { background: linear-gradient(135deg, #07091a 0%, #111630 100%); color: #fff; padding: 48px 56px 40px; page-break-after: always; }
+  .cover-logo { font-size: 28px; font-weight: 900; letter-spacing: -0.5px; margin-bottom: 8px; }
+  .cover-logo span { background: linear-gradient(90deg, #00d4ff, #7b2fff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .cover-sub { font-size: 13px; color: rgba(255,255,255,0.5); margin-bottom: 48px; }
+  .cover-url { font-size: 18px; font-weight: 700; color: #00d4ff; margin-bottom: 8px; word-break: break-all; }
+  .cover-ts { font-size: 12px; color: rgba(255,255,255,0.4); margin-bottom: 40px; }
+  .cover-risk { display: inline-block; font-size: 22px; font-weight: 900; padding: 10px 24px; border-radius: 8px; background: ${riskColor}22; color: ${riskColor}; border: 2px solid ${riskColor}66; }
+  .stats { display: flex; gap: 20px; margin-top: 36px; }
+  .stat-box { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 16px 22px; flex: 1; text-align: center; }
+  .stat-num { font-size: 32px; font-weight: 900; }
+  .stat-lbl { font-size: 10px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 0.8px; margin-top: 2px; }
+  .section { padding: 36px 56px; }
+  .section-title { font-size: 16px; font-weight: 800; color: #07091a; margin-bottom: 20px; padding-bottom: 8px; border-bottom: 2px solid #00d4ff; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { background: #f0f4f8; color: #4a5568; font-weight: 700; text-transform: uppercase; font-size: 10px; letter-spacing: 0.6px; padding: 8px 12px; text-align: left; }
+  td { padding: 9px 12px; border-bottom: 1px solid #e8edf2; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8fafc; }
+  .footer { text-align: center; padding: 20px; font-size: 11px; color: #9ba8b8; border-top: 1px solid #e8edf2; }
+  @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+</style>
+</head>
+<body>
+  <div class="cover">
+    <div class="cover-logo"><span>WebSecuity</span></div>
+    <div class="cover-sub">Vulnerability Scan Report</div>
+    <div class="cover-url">${escapeHtml(r.url)}</div>
+    <div class="cover-ts">Generated: ${ts}</div>
+    <div class="cover-risk">RISK: ${(r.overall_risk || 'INFO').toUpperCase()}</div>
+    <div class="stats">
+      <div class="stat-box"><div class="stat-num" style="color:#ff2d55">${r.critical_count || 0}</div><div class="stat-lbl">Critical</div></div>
+      <div class="stat-box"><div class="stat-num" style="color:#ff6b35">${r.high_count || 0}</div><div class="stat-lbl">High</div></div>
+      <div class="stat-box"><div class="stat-num" style="color:#ffd60a">${r.medium_count || 0}</div><div class="stat-lbl">Medium</div></div>
+      <div class="stat-box"><div class="stat-num" style="color:#34c759">${r.low_count || 0}</div><div class="stat-lbl">Low</div></div>
+      <div class="stat-box"><div class="stat-num" style="color:#00d4ff">${r.total_vulnerabilities || 0}</div><div class="stat-lbl">Total</div></div>
+    </div>
+  </div>
+  <div class="section">
+    <div class="section-title">Vulnerability Findings</div>
+    ${findings.length === 0 ? '<p style="color:#636e7b;padding:16px 0">No findings were reported in this scan.</p>' : `
+    <table>
+      <thead><tr><th>Severity</th><th>Module</th><th>Description</th><th>Parameter / Header</th></tr></thead>
+      <tbody>${findingRows}</tbody>
+    </table>`}
+  </div>
+  <div class="footer">WebSecuity &mdash; Automated Web Vulnerability Scanner &mdash; ${ts}</div>
+</body>
+</html>`;
+
+  const win = window.open('', '_blank');
+  if (!win) { toast('Pop-up blocked — please allow pop-ups for this site.', 'error'); return; }
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  setTimeout(() => {
+    win.print();
+    toast('PDF ready — use your browser\'s print dialog to save as PDF.', 'success');
+  }, 500);
 }
 
 function copyJSON() {
@@ -700,7 +896,7 @@ async function loadHistoryScanResults(scanId) {
    Init
    ══════════════════════════════════════════════ */
 function init() {
-  window.app = { navigate, loadHistory };
+  window.app = { navigate, loadHistory, openCrawlerModal };
 
   // Nav links — guard history behind login
   $$('.nav-item[data-page]').forEach(link => {
@@ -783,8 +979,15 @@ function init() {
   $('#history-new-scan-btn')?.addEventListener('click', () => navigate('scanner'));
 
   // Export buttons
-  $('#download-json-btn')?.addEventListener('click', exportJSON);
+  $('#download-report-btn')?.addEventListener('click', showDownloadModal);
   $('#copy-json-btn')?.addEventListener('click', copyJSON);
+  // Download modal choices
+  $('#download-json-choice')?.addEventListener('click', exportJSON);
+  $('#download-pdf-choice')?.addEventListener('click', exportPDF);
+  $('#download-modal-close')?.addEventListener('click', closeDownloadModal);
+  $('#download-modal-overlay')?.addEventListener('click', (e) => {
+    if (e.target === $('#download-modal-overlay')) closeDownloadModal();
+  });
 
   // Select all modules
   const selectAll = $('#select-all');

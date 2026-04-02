@@ -993,7 +993,7 @@ body {
   background: rgba(17, 22, 48, 0.95);
   backdrop-filter: blur(20px);
 }
-.modal-title { font-size: 16px; font-weight: 700; }
+.modal-title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .modal-close {
   background: none;
   border: none;
@@ -1436,4 +1436,114 @@ body {
 .overview-item p {
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+/* ── Download Format Modal ───────────────────── */
+.download-modal {
+  width: 100%;
+  max-width: 480px;
+  padding: 0;
+  animation: pop-in 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.92) translateY(12px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.download-modal-hint {
+  padding: 12px 24px 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.download-format-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 24px 24px;
+}
+
+.download-format-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 18px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.18s ease;
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+  position: relative;
+  overflow: hidden;
+}
+.download-format-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  pointer-events: none;
+}
+.download-format-card:hover {
+  border-color: var(--border-bright);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 212, 255, 0.12);
+}
+
+.download-format-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: transform 0.18s ease;
+}
+.download-format-card:hover .download-format-icon {
+  transform: scale(1.08);
+}
+.download-format-icon svg { width: 22px; height: 22px; }
+
+.download-icon-pdf {
+  background: rgba(255, 45, 85, 0.12);
+  color: var(--sev-critical);
+  border: 1px solid rgba(255, 45, 85, 0.2);
+}
+.download-icon-json {
+  background: var(--cyan-dim);
+  color: var(--cyan);
+  border: 1px solid rgba(0, 212, 255, 0.2);
+}
+
+.download-format-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.download-format-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.download-format-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.download-arrow {
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: transform 0.18s ease, color 0.18s ease;
+}
+.download-format-card:hover .download-arrow {
+  transform: translateX(4px);
+  color: var(--cyan);
 }

@@ -434,12 +434,16 @@ async def test_account_lockout(
     errors: List[str],
     checks: List[str],
 ):
-    if not form and not login_url:
+    # Only test lockout if a real login form was discovered.
+    # Without a form we have no confirmed login endpoint — testing an arbitrary
+    # URL would always generate a false positive because normal pages never
+    # return 429 / lockout keywords for random POST data.
+    if not form:
         return
 
-    action = form["action"] if form else login_url
-    method = form["method"] if form else "post"
-    base_fields = form["fields"].copy() if form else {}
+    action = form["action"]
+    method = form["method"]
+    base_fields = form["fields"].copy()
 
     attempt_count = 0
     locked = False
@@ -475,7 +479,9 @@ async def test_account_lockout(
         except Exception as e:
             errors.append(f"Lockout test error attempt {i}: {str(e)}")
 
-    if not locked:
+    # Only flag a vulnerability if we actually completed attempts AND no lockout was
+    # seen.  attempt_count == 0 means every request raised an exception — not a finding.
+    if not locked and attempt_count > 0:
         findings.append(AuthFinding(
             check_type=AuthCheckType.ACCOUNT_LOCKOUT,
             target_url=action,

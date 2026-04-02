@@ -5,7 +5,12 @@ Exposes endpoints for detecting Cross-Site Scripting vulnerabilities.
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from models.xss_models import XSSRequest, XSSResult
-from scanners.xss_scanner import run_xss_scan, REFLECTED_PAYLOADS, DOM_PAYLOADS, STORED_XSS_MARKERS
+from scanners.xss_scanner import (
+    run_xss_scan,
+    REFLECTED_PAYLOAD_TEMPLATES as REFLECTED_PAYLOADS,
+    DOM_PAYLOAD_TEMPLATES as DOM_PAYLOADS,
+    STORED_XSS_MARKER_TEMPLATES as STORED_XSS_MARKERS,
+)
 import uuid
 from typing import Dict
 

@@ -6,6 +6,7 @@ from routers import sqli, crawler, xss, bac, auth, ssl, http
 from routers import scan
 from routers import users, history
 from database.db import init_db
+from scanners.oob_server import oob_server
 import os
 
 app = FastAPI(
@@ -23,10 +24,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize database on startup
+# Initialize database and OOB callback server on startup
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     init_db()
+    await oob_server.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await oob_server.stop()
 
 # Register API routers
 app.include_router(sqli.router, prefix="/api/sqli", tags=["SQL Injection"])

