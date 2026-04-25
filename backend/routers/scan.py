@@ -228,18 +228,25 @@ async def _run_all_modules(
         if job_id and job_id in unified_jobs:
             unified_jobs[job_id]["progress"] = 20
             unified_jobs[job_id]["status_message"] = f"Discovered {len(target_urls)} endpoints for scanning"
+    else:
+        # Crawler skipped — jump straight past the discovery phase
+        if job_id and job_id in unified_jobs:
+            unified_jobs[job_id]["progress"] = 20
+            unified_jobs[job_id]["status_message"] = "Crawler skipped — starting vulnerability assessment..."
 
-    # 2. Pipeline Stage 2: Assessment (Scanners)
+    # 2. Pipeline Stage 2: Assessment (Scanners) — run concurrently but update progress per completion
     remaining_modules = [m for m in valid_modules if m != "crawler"]
-    
+    total_to_run = len(remaining_modules)
+
     if job_id and job_id in unified_jobs:
-        unified_jobs[job_id]["status_message"] = f"Starting vulnerability assessment ({len(remaining_modules)} modules)..."
-    
-    tasks = [_run_module(m, target_urls, timeout) for m in remaining_modules]
-    
-    if tasks:
-        raw_results = await asyncio.gather(*tasks, return_exceptions=False)
-        for module_name, data in raw_results:
+        unified_jobs[job_id]["status_message"] = f"Starting vulnerability assessment ({total_to_run} modules)..."
+
+    if remaining_modules:
+        tasks = {asyncio.ensure_future(_run_module(m, target_urls, timeout)): m for m in remaining_modules}
+        completed_count = 0
+
+        for coro in asyncio.as_completed(tasks.keys()):
+            module_name, data = await coro
             results[module_name] = data
             is_error = isinstance(data, dict) and (
                 "error" in data
@@ -249,13 +256,13 @@ async def _run_all_modules(
                 failed.append(module_name)
             else:
                 completed.append(module_name)
-            
+
+            completed_count += 1
             if job_id and job_id in unified_jobs:
-                completed_count = len(completed) + len(failed)
-                total_to_run = len(remaining_modules)
-                progress_step = int((completed_count / total_to_run) * 70) + 25
+                # Scale 20%->95% across the assessment phase
+                progress_step = 20 + int((completed_count / total_to_run) * 75)
                 unified_jobs[job_id]["progress"] = min(95, progress_step)
-                unified_jobs[job_id]["status_message"] = f"Completed {module_name} scan..."
+                unified_jobs[job_id]["status_message"] = f"Completed {module_name} ({completed_count}/{total_to_run})"
             
     duration = int(time.monotonic() - start)
 
@@ -458,6 +465,19 @@ async def get_unified_result(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
     if job["status"] == "running":
-        return {"job_id": job_id, "status": "running", "progress": job.get("progress", 0), "result": None}
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "progress": job.get("progress", 0),
+            "status_message": job.get("status_message", ""),
+            "result": None,
+        }
 
-    return {"job_id": job_id, "status": job["status"], "progress": 100, "result": job.get("result"), "error": job.get("error")}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": 100,
+        "status_message": job.get("status_message", ""),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
